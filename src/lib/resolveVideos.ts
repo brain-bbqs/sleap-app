@@ -1919,6 +1919,12 @@ function persistHdf5Dataset(video: Video): void {
 export interface AssignBackendOptions {
   silent?: boolean;
   /**
+   * The sleap-io.js backend to open a URL with, when the URL says nothing about
+   * its format (an extensionless presigned or blob link whose type an embedding
+   * host declared). Unset: chosen from the URL's extension, as before.
+   */
+  backend?: "mp4box" | "mediabunny" | "media" | "avi";
+  /**
    * Force (`true`/`false`) grayscale on the newly-built backend, or leave it
    * unset (`undefined`) to inherit whatever `video.backendMetadata.grayscale`
    * already records (the round-trip case: reopening/relinking a video that
@@ -2173,7 +2179,7 @@ export async function assignVideoBackendFromUrl(
       : (video.backendMetadata.grayscale as boolean | null | undefined);
   const ok = await probeAndAssignBackend(
     video,
-    () => createVideoBackend(url, { grayscale }),
+    () => createVideoBackend(url, { grayscale, ...(opts?.backend ? { backend: opts.backend } : {}) }),
     getBasename(url),
     { ...opts, grayscale }
   );
