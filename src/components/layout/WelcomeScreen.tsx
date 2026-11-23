@@ -30,6 +30,7 @@ import { WelcomeEnvironmentsPanel } from "./WelcomeEnvironmentsPanel";
 import { UpdatePingDot, UpdatePill, useEnvironmentUpdateStatus } from "./UpdateIndicator";
 import { cn } from "@/lib/utils";
 import { CHECK_ENVIRONMENT_STEP } from "@/lib/tutorial/steps";
+import { publicAssetUrl } from "@/lib/assetBase";
 
 export function WelcomeScreen() {
   const { openProject, openFromDrop, loading, error } = useFileIO();
@@ -106,7 +107,7 @@ export function WelcomeScreen() {
       // the lower viewport and never clips (>=20px from the edge), #132.
       className="flex-1 flex items-end justify-center relative pb-6"
       style={{
-        backgroundImage: `url(${import.meta.env.BASE_URL}background.jpg)`,
+        backgroundImage: `url(${publicAssetUrl("background.jpg")})`,
         backgroundSize: "cover",
         backgroundPosition: "center",
       }}

@@ -60,12 +60,11 @@ import {
   writeClose,
 } from "./nativeWrite";
 import { fileSize, readRange } from "./nativeRange";
+import { h5wasmUrl } from "./assetBase";
 
 // Same derivation as loadProject.ts / saveEmbeddedPkgStreaming.ts: h5wasm must be
 // served same-origin so the streaming Worker can load it under cross-origin
 // isolation (COEP blocks the default cross-origin CDN importScripts).
-const H5WASM_URL =
-  typeof location !== "undefined" ? `${location.origin}/h5wasm/h5wasm.js` : undefined;
 
 /** The five mutable label tables, in the order the gate/verify iterate them. */
 const LABEL_TABLES = [
@@ -208,7 +207,7 @@ async function probeOnDisk(path: string): Promise<OnDiskProbe> {
   const size = await fileSize(path);
   const source: RangeSource = { size, readRange: (o, l) => readRange(path, o, l) };
   const reader = new StreamingH5File();
-  await reader.openRange(source, { h5wasmUrl: H5WASM_URL });
+  await reader.openRange(source, { h5wasmUrl: h5wasmUrl() });
   try {
     // Label-table layouts. Absent tables are omitted (⇒ the gate skips their
     // resizability check; the writer creates a resizable one on demand).
@@ -322,7 +321,7 @@ async function verifyInPlace(
   const size = await fileSize(path);
   const source: RangeSource = { size, readRange: (o, l) => readRange(path, o, l) };
   const reader = new StreamingH5File();
-  await reader.openRange(source, { h5wasmUrl: H5WASM_URL });
+  await reader.openRange(source, { h5wasmUrl: h5wasmUrl() });
   try {
     // 1. Row counts of every patched table match the update.
     const expectedRows: Array<[string, number]> = [
@@ -505,7 +504,7 @@ export async function saveLabelsInPlace(
     };
     const writer = new StreamingH5Writer();
     try {
-      await writer.openWrite(destSink, destPath, destSize, H5WASM_URL);
+      await writer.openWrite(destSink, destPath, destSize, h5wasmUrl());
       const res = await writer.updateLabelsInPlace(update);
       if (res.success !== true) {
         throw new Error(

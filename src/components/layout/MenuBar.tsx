@@ -27,6 +27,7 @@ import {
   MenubarRadioItem,
 } from "@/components/ui/menubar";
 import { Button } from "@/components/ui/button";
+import { publicAssetUrl } from "@/lib/assetBase";
 
 export function MenuBar() {
   const menu = useAppMenu();
@@ -43,7 +44,7 @@ export function MenuBar() {
       {!isTauri && (
         <div className="flex items-baseline gap-1.5 px-3 text-sm font-semibold tracking-wider text-primary select-none">
           <img
-            src={`${import.meta.env.BASE_URL}icon.png`}
+            src={publicAssetUrl("icon.png")}
             alt=""
             className="h-4 w-4 self-center"
           />

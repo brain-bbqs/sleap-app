@@ -26,16 +26,13 @@ import type { WorkerClient } from "@/lib/protocolV1/client";
 import { WorkerProtocolError, FS_NOT_FOUND, FS_FORBIDDEN, PROTO_UNKNOWN_METHOD } from "@/lib/protocolV1/errors";
 import { translatePath, type PathMapping } from "@/lib/pathMappings";
 import type { VideoVisibility } from "@/lib/remoteVisibility";
+import { h5wasmUrl } from "./assetBase";
 
 // Serve h5wasm same-origin so the streaming Worker can load it under
 // cross-origin isolation (COOP/COEP) — COEP blocks the default cross-origin
 // CDN importScripts. Duplicated (not shared) with loadProject.ts/
 // draftRestoreTauri.ts/etc. — same convention as every other reader in this
 // codebase that needs it.
-const H5WASM_URL =
-  typeof location !== "undefined"
-    ? `${location.origin}/h5wasm/h5wasm.js`
-    : undefined;
 
 // Mirrors the worker's `file_manager.py` `MAX_READ_BYTES` — `fs.read` caps
 // any single call's response to this, so a page larger than it (an
@@ -276,7 +273,7 @@ export async function loadWorkerLabels(
       // predictions file and nothing the wizard uses.
       userInstancesOnly: true,
       filenameHint: path,
-      h5wasmUrl: H5WASM_URL,
+      h5wasmUrl: h5wasmUrl(),
       onProgress: (_current, _total, message) => {
         if (message) progress.stage = message;
         report();
@@ -540,7 +537,7 @@ async function readEmbeddedPreviewFrame(
     const stat = await client.fsStat(labelsPath);
     h5 = await openH5Worker(createWorkerFileRangeSource(client, labelsPath, stat.size), {
       filenameHint: labelsPath,
-      h5wasmUrl: H5WASM_URL,
+      h5wasmUrl: h5wasmUrl(),
     });
     const meta = video.backendMetadata ?? {};
     const datasetPath =
