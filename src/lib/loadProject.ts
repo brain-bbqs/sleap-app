@@ -210,12 +210,17 @@ export async function loadProjectFromFile(file: File): Promise<boolean> {
  * a full buffered download). The remotely-opened project has no local path/handle,
  * so it is Save-As only.
  */
-export async function loadProjectFromUrl(url: string): Promise<boolean> {
+export interface UrlLoadOptions {
+  /** The file's name, for a URL whose path says nothing about it (an extensionless presigned link). */
+  name?: string;
+}
+
+export async function loadProjectFromUrl(url: string, opts: UrlLoadOptions = {}): Promise<boolean> {
   const store = useAppStore.getState();
 
   if (!(await confirmDiscardUnsavedWork("Opening a new project"))) return false;
 
-  const name = basenameFromUrl(url);
+  const name = opts.name ?? basenameFromUrl(url);
   store.setLoading(true, `Streaming ${name}...`);
 
   try {

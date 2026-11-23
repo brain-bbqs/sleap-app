@@ -107,4 +107,14 @@ describe("loadProjectFromUrl", () => {
       "corrupt or non-SLP file"
     );
   });
+
+  it("takes a declared name for a link whose path says nothing about the file", async () => {
+    // An extensionless presigned link, as an archive hands out: the name travels beside it.
+    const url = "https://bucket.example/blobs/9f2c41?X-Amz-Signature=sig";
+    expect(await loadProjectFromUrl(url, { name: "labels.v001.slp" })).toBe(true);
+    const [source, options] = readSlpStreamingMock.mock.calls[0] as unknown as [string, { filenameHint?: string }];
+    expect(source).toBe(url);
+    expect(options.filenameHint).toBe("labels.v001.slp");
+    expect(useAppStore.getState().filename).toBe("labels.v001.slp");
+  });
 });
