@@ -1,0 +1,2196 @@
+/**
+ * Connection to a sleap-connect worker (protocol v1, pairing model).
+ *
+ * Replaces the old room/WebRTC/GitHub-OAuth model — see
+ * docs/plans/2026-09-26-sleap-connect-protocol-v1-spec.md §3. There is no
+ * signaling server and no account: the app persists a small list of workers
+ * it has paired with (keyed by `node_id`, Syncthing/Plex-style), and talks
+ * to at most one of them at a time via `WorkerClient` (src/lib/protocolV1).
+ *
+ * **Known interim gap** (already accepted/deferred at the worker side — see
+ * talmolab/sleap-connect PRs #84-#88 — not a new limitation introduced here):
+ * - The worker's `CommandBuilder.build_command` only ever runs
+ *   `config_contents[0]` — it doesn't support a multi-model pipeline
+ *   (top-down centroid + centered-instance) as a single job. This store
+ *   reproduces the old one-`JOB_COMPLETE`-per-model UX by submitting one
+ *   job per model sequentially instead (see `submitJob`/`submitSingleJob`).
+ *
+ * Training telemetry (`job.epoch`/`job.curve`/`job.metric`) is parsed by
+ * `parseJobTelemetry` and handed to `submitJob`'s `onTelemetry` tagged with
+ * the per-model job index, so the caller can route it to the right model.
+ * `job.log`'s optional `progress: true` flag (an in-place tqdm redraw) is
+ * forwarded as `onProgress`'s second argument.
+ */
+import yaml from "js-yaml";
+import { create } from "zustand";
+import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
+import { mergeShared, sameShared, type SharedConnectState } from "@/lib/connectSync";
+import type {
+  FileEntry,
+  JobResult,
+  JobResultBlobRef,
+  JobSpec,
+  TrainJobSpec,
+} from "@/lib/sleapConnect";
+import { APP_VERSION } from "@/lib/version";
+import { isTauri } from "@/platform/index";
+import { hydraQuote } from "@/platform/trainingArgs";
+import type { AgentInfo } from "@/lib/protocolV1/envelope";
+import { defaultDeviceName, normalizeDeviceName } from "@/lib/protocolV1/deviceName";
+import type {
+  FsListResult,
+  JobRun,
+  PairedDevice,
+  JobStatus,
+  JobSummary,
+  Mount,
+  WorkerClient,
+  WorkerEvent,
+  WorkerInfo,
+} from "@/lib/protocolV1/client";
+import { parseJobTelemetry, type JobTelemetry } from "@/lib/protocolV1/jobTelemetry";
+import {
+  ManagedConnection,
+  isUnpairedError,
+  type LinkStatus,
+} from "@/lib/protocolV1/managedConnection";
+import {
+  WorkerProtocolError,
+  FS_NOT_FOUND,
+  FS_FORBIDDEN,
+  AUTH_UNTRUSTED,
+} from "@/lib/protocolV1/errors";
+import { decodePairCode, isPairCode, PairCodeError } from "@/lib/protocolV1/pairCode";
+import type { PathMapping } from "@/lib/pathMappings";
+import {
+  irohTransportAvailable,
+  parseTicketIroh,
+  toIrohDialTarget,
+  transportLabel,
+  type IrohEndpointInfo,
+  type TransportKind,
+} from "@/lib/protocolV1/transport";
+
+const AGENT_INFO: AgentInfo = {
+  name: "sleap-app",
+  version: APP_VERSION,
+  platform: isTauri ? "tauri" : "web",
+};
+
+// ── Types ─────────────────────────────────────────────────────────
+
+export type ConnectionStatus =
+  | "disconnected"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "error";
+
+/** `statWorkerPath`'s answer. */
+export interface WorkerPathStat {
+  exists: boolean;
+  type?: "file" | "directory";
+  /** False: exists, but outside the worker's shared folders (jobs can read it; it can't be browsed). */
+  shared?: boolean;
+  /** An older worker refused to say (the path is outside its shared folders). */
+  forbidden?: boolean;
+}
+
+/** A worker this device has paired with — persisted, Syncthing/Plex-style. */
+export interface PairedWorker {
+  nodeId: string;
+  label: string;
+  addrs: string[];
+  pairedAt: string;
+  /** Direct-connect (iroh) reachability from the pairing ticket, if it had any (stage 2.1). */
+  iroh?: IrohEndpointInfo;
+  /** The transport last connected over, reused by one-click reconnects. Absent = "ws". */
+  transport?: TransportKind;
+  /**
+   * Per-worker local<->worker path rules (Locate-on-worker overrides, plus a
+   * one-time import of the legacy global `~/.sleap-rtc/config.toml` mappings
+   * on this worker's first-ever connect — see `connectToWorker`). `undefined`
+   * means "never imported yet"; once set (even to `[]`) it's never
+   * re-imported, so a user who deliberately clears every rule stays cleared.
+   */
+  pathRules?: PathMapping[];
+  /**
+   * When the worker refused this device as no longer paired (removed there
+   * with `sleap-connect clients remove`). Set, nothing dials it automatically
+   * (background resume, the Connect window's refresh) — only re-pairing or
+   * an explicit connect does. Cleared by re-pairing.
+   */
+  unpairedAt?: string;
+  /**
+   * Folders picked with Change… for "this window" runs' outputs on this
+   * worker, keyed by project (`projectTag(projectPath).id`).
+   */
+  outputDirs?: Record<string, string>;
+}
+
+/**
+ * A worker's pairing ticket (spec §3.2) — either parsed from the legacy
+ * pasted-JSON ticket `sleap-connect pair` used to print, or decoded from its
+ * one-line replacement (`decodePairCode`, PR6a §a.1), which returns this
+ * exact shape so `pairWithTicket` never needs to branch on which it got.
+ */
+export interface PairingTicket {
+  node_id: string;
+  addrs: string[];
+  secret: string;
+  /** Unix seconds — the worker's own wire format. Always present on a decoded pairing code; only checked for expiry on that path today (see `pairWithTicket`). */
+  expires_at?: number;
+  /** Optional direct-connect info (stage 2.1): `{ node_id?, relay_url?, direct_addrs? }`. */
+  iroh?: unknown;
+}
+
+/**
+ * A remote job this device is tracking against a specific paired worker.
+ * Superseded the old single-slot `(node_id, job_id)` pair (spec §3.4) once
+ * the Connect window (PR2-5) needed to show several jobs at once — across
+ * workers, across a sequential multi-model training run, and across app
+ * restarts. `workerId` guards against checking a job's status against the
+ * wrong worker after switching which one is selected; `source` distinguishes
+ * a job this window submitted ("window", all PR2b ever produces) from one
+ * discovered already running on a worker by PR5's job-file scan
+ * ("worker-file").
+ */
+export interface TrackedJob {
+  workerId: string;
+  jobId: string;
+  /** Highest event `seq` already applied — lets a reconnect catch up without reprocessing. */
+  lastSeq: number;
+  kind: "train" | "track";
+  /** Human-readable summary, e.g. "Train centroid", "Inference". */
+  label: string;
+  source: "window" | "worker-file";
+  state: "active" | "completed" | "failed" | "canceled";
+  /** The worker's failure/cancel detail — set alongside a terminal `state` other than "completed"; the Connect window's Jobs tab (PR4b) shows this as the row's error text. */
+  error?: string;
+  /** Whether the user has seen this job reach a terminal state (gates resume-on-launch toasts). */
+  seen: boolean;
+  submittedAt: number;
+}
+
+/** A job found still active on a worker from a previous session (spec §3.4). */
+export interface ReattachableJob {
+  jobId: string;
+  state: string;
+}
+
+/**
+ * A `job.log` line. `isProgress` is the worker's `progress: true` flag: the
+ * line is the current state of an in-place progress bar and should REPLACE
+ * the previous progress line rather than append.
+ */
+export type JobLogHandler = (line: string, isProgress?: boolean) => void;
+
+export interface SubmitJobOptions {
+  /** Fires for every model's job of a split multi-model train spec except the last (whose result is the return value). */
+  onModelComplete?: (result: JobResult) => void;
+  /**
+   * Structured training telemetry. `jobIndex` is the job's position in a
+   * split multi-model train spec (= its `config_contents` index), 0 for a
+   * single job.
+   */
+  onTelemetry?: (telemetry: JobTelemetry, jobIndex: number) => void;
+  /**
+   * Link this submission to an EXISTING run instead of minting a fresh
+   * `run.id` — `trainingStore`'s own post-training inference flow passes its
+   * training run's id here (with `stage: "inference"`) so the follow-up
+   * track job groups under that training run in the Connect window's Jobs
+   * tab (`WorkerJobs.groupJobs`), the same way the worker's own
+   * `post_inference` chaining (sleap-connect PR5w) does. Omitted, `submitJob`
+   * behaves exactly as before: one fresh run id per call, untagged (a plain
+   * training job). `trainingStore` also passes its own id WITHOUT a stage
+   * for the training jobs, so its Stop/Cancel can name exactly its run.
+   */
+  run?: { id: string; stage?: "inference" };
+}
+
+export interface ConnectOptions {
+  transport?: TransportKind;
+}
+
+const TERMINAL_JOB_STATES = new Set(["completed", "failed", "canceled"]);
+
+interface ConnectState {
+  // ── Persisted ──────────────────────────────────────────────────
+  pairedWorkers: PairedWorker[];
+  /**
+   * The worker this window works with. Per window (kept in sessionStorage,
+   * see `SELECTED_WORKER_SESSION_KEY`), not shared: another window picking a
+   * different worker never changes this one's.
+   */
+  selectedWorkerId: string | null;
+  /** The worker some window most recently selected — shared; a new window's starting selection. */
+  lastSelectedWorkerId: string | null;
+  trackedJobs: TrackedJob[];
+  /**
+   * The name this device reports to every worker (`hello`'s
+   * `agent.device_name`); null = the OS computer name, or "<Browser> on <OS>"
+   * in a browser (see `resolveDeviceName`).
+   */
+  deviceName: string | null;
+
+  // ── Runtime (not persisted) ─────────────────────────────────────
+  connectionStatus: ConnectionStatus;
+  connectionError: string | null;
+  workerMounts: Mount[];
+  /** Set once per connect if the worker just connected to has an active tracked job. */
+  reattachableJob: ReattachableJob | null;
+  /** Transport of the current/most recent connection attempt; `null` when disconnected. */
+  activeTransport: TransportKind | null;
+  /**
+   * Live link status per managed worker (keyed by `nodeId`) — every worker
+   * that's either selected or has an active tracked job has an entry here,
+   * even ones other than the selected worker (a background job's connection
+   * keeps reconnecting after `disconnect()`). `connectionStatus`/
+   * `activeTransport` above are just this map's entry for the selected
+   * worker, projected out for existing single-worker callers.
+   */
+  connections: Record<string, { status: LinkStatus; route: TransportKind }>;
+  /**
+   * Most recent `clientFor`/`refreshWorkerInfo` failure per worker, keyed by
+   * `nodeId` — the Connect window (PR4b) shows this per-card for a worker
+   * that isn't the selected backend, where `connectionError` (selected-only)
+   * doesn't reach. Cleared on that worker's next successful connect.
+   */
+  workerErrors: Record<string, string | null>;
+  /** Last-fetched `worker.info` snapshot per worker (sleap-connect #98), keyed by `nodeId`. */
+  workerInfo: Record<string, WorkerInfo>;
+  _client: WorkerClient | null;
+
+  // ── Actions ──────────────────────────────────────────────────────
+  /**
+   * A connected, authenticated client for ANY paired worker — not just the
+   * selected one (`_client`/`submitJob`/etc. stay selected-worker-only).
+   * Reuses that worker's managed connection if one already exists (selected
+   * or from a prior `clientFor` call); otherwise creates one and dials it.
+   * Records the failure in `workerErrors` and drops the managed connection
+   * on a failed dial, so a later call starts fresh rather than reusing a
+   * dead instance.
+   */
+  clientFor: (workerId: string) => Promise<WorkerClient>;
+  /**
+   * Stops and drops every managed connection that isn't the selected worker
+   * and has no active tracked job — called when the Connect window (PR4b)
+   * closes, so browsing other workers' jobs/info there doesn't leave their
+   * connections open indefinitely afterward.
+   */
+  releaseIdleConnections: () => void;
+  /** Fetches `worker.info` for `workerId` into `workerInfo`; a failure lands in `workerErrors` instead of throwing. */
+  refreshWorkerInfo: (workerId: string) => Promise<void>;
+  /** Every job on `workerId` (not just ones this window tracks) — the Connect window's Jobs tab. */
+  listJobs: (workerId: string) => Promise<JobSummary[]>;
+  jobDetail: (workerId: string, jobId: string) => Promise<JobStatus>;
+  /** Cancel/stop a job on ANY paired worker, not just the selected one. */
+  cancelJobOn: (workerId: string, jobId: string, mode: "cancel" | "stop") => Promise<void>;
+  /**
+   * Removes `jobIds`' records from `workerId` (PR6a §a.3) — job records
+   * only, nothing on disk (see `WorkerClient.jobsDelete`'s doc). All-or-
+   * nothing: throws `job.active` (and deletes nothing) if any of `jobIds`
+   * is currently running or about to be. On success, prunes those ids from
+   * `trackedJobs`, drops their live event subscriptions, and forgets their
+   * `notifiedJobIds` entry (so a job id the worker ever reuses — it never
+   * does today, but nothing here assumes that — would get its own
+   * finish-toast again rather than being silently deduped against a job
+   * this device no longer has any record of).
+   */
+  deleteJobsOn: (workerId: string, jobIds: string[]) => Promise<void>;
+  /**
+   * Claim a fresh pairing ticket (JSON from `sleap-connect pair`) and connect.
+   * `options.transport` picks the dial explicitly (default `"ws"`); `"iroh"`
+   * needs the desktop app and an `iroh` section in the ticket.
+   */
+  pairWithTicket: (
+    ticketJson: string,
+    addrOverride?: string,
+    options?: ConnectOptions,
+  ) => Promise<void>;
+  /**
+   * Reconnect to an already-paired worker by node_id. Without an explicit
+   * `options.transport`, reuses the transport last connected over (`"ws"`
+   * if none, or if iroh is remembered but unavailable here).
+   */
+  connectToWorker: (nodeId: string, options?: ConnectOptions) => Promise<void>;
+  /** Select (and connect to) a paired worker, or `null` to disconnect. */
+  selectWorker: (nodeId: string | null, options?: ConnectOptions) => Promise<void>;
+  disconnect: () => void;
+  /**
+   * Removes the worker from this app, and — if it can be reached within a
+   * few seconds — unpairs this device there too (`clients.leave`), so it
+   * drops off the worker's device list. Resolves once that attempt is done;
+   * the local removal is immediate.
+   */
+  forgetWorker: (nodeId: string) => Promise<void>;
+  /**
+   * Lists `path` on the selected worker, paging through `fs.list` from
+   * `offset` (default 0). With `limit`, stops once at least that many
+   * entries are in — the file browser loads big folders a batch at a time;
+   * fewer than `limit` back means the folder is done.
+   */
+  browseRemoteDir: (path: string, offset?: number, limit?: number) => Promise<FileEntry[]>;
+  /**
+   * `browseRemoteDir` for ANY paired worker, not just the selected one —
+   * the launcher wizard (PR5b) browses whichever worker it's building a job
+   * for. Dials via `clientFor` (so it connects on demand, unlike
+   * `browseRemoteDir`'s "must already be connected" guard) and paginates
+   * `fs.list` the same way.
+   */
+  browseRemoteDirOn: (workerId: string, path: string, offset?: number, limit?: number) => Promise<FileEntry[]>;
+  /** `fs.mounts` for ANY paired worker, not just the selected one — dials via `clientFor`. */
+  mountsFor: (workerId: string) => Promise<Mount[]>;
+  /** `clients.list` — the devices paired with `workerId` (who can use it). Dials via `clientFor`. */
+  devicesFor: (workerId: string) => Promise<PairedDevice[]>;
+  /**
+   * Renames this device everywhere: saved for future hellos, and pushed now
+   * (`clients.rename`) to every worker it's currently connected to.
+   * Workers it isn't connected to pick the name up on the next connect.
+   */
+  setDeviceName: (name: string) => Promise<void>;
+  /** Statted via the worker's `fs.stat` — requires an authenticated connection (same precondition as `browseRemoteDir`). */
+  statWorkerPath: (path: string) => Promise<WorkerPathStat>;
+  /** Add (or replace, by `rule.local`) one path rule for `workerId`. */
+  addPathRule: (workerId: string, rule: PathMapping) => void;
+  /** Remember (or with `null`, forget) the output folder picked for a project on `workerId`. */
+  setOutputDir: (workerId: string, projectKey: string, dir: string | null) => void;
+  /** Remove the rule (if any) whose `local` matches, for `workerId`. */
+  clearPathRule: (workerId: string, local: string) => void;
+  submitJob: (
+    spec: JobSpec,
+    onProgress: JobLogHandler,
+    options?: SubmitJobOptions,
+  ) => Promise<JobResult>;
+  /**
+   * Submits `spec` to `workerId` WITHOUT waiting for any job to finish — the
+   * launcher wizard's (PR5b) "+ New job" and "Run again"/"Run inference" row
+   * actions, which fire into a worker's queue and move on rather than
+   * blocking on a live progress stream the way `submitJob` does. A
+   * multi-model train spec is split the same way `submitJob` splits one
+   * (`isMultiModelTrainSpec`), but every resulting job is submitted via
+   * `jobsSubmit` up front, sharing one `run` id — not one-at-a-time as each
+   * prior model finishes. Each job is tracked (`opts.source`) and watched in
+   * the background (`watchTrackedJob`), so its own finish toast still fires;
+   * a chained post-train inference job the worker reports via
+   * `chained_job_ids` (PR5w) is tracked and watched the same way. Returns
+   * every job id this submission produced, in run order.
+   */
+  submitJobsOn: (
+    workerId: string,
+    spec: JobSpec,
+    opts: { source: TrackedJob["source"] },
+  ) => Promise<string[]>;
+  /** Hard-cancel every unfinished job of run `runId` (default: the latest
+   *  active tracked job's run). See `runJobsToEnd`. */
+  cancelJob: (runId?: string) => void;
+  /** Gracefully early-stop the model in progress of run `runId` (default:
+   *  the latest active tracked job's run). See `runJobsToEnd`. */
+  stopJob: (runId?: string) => void;
+  /** Fetch a result blob's bytes (e.g. `JobResult.resultBlobs.predictions`). */
+  fetchResultBlob: (ref: JobResultBlobRef) => Promise<Uint8Array>;
+  /**
+   * Called once on launch (`AppShell`): reconnects to every worker with an
+   * `active` tracked job, catches up on jobs that finished while unwatched
+   * (toasting + marking terminal), and re-watches ones still running.
+   */
+  resumeTrackedJobs: () => Promise<void>;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────
+
+/**
+ * Adds or replaces a paired worker. Re-pairing a worker this device already
+ * knows (e.g. after it was unpaired there) keeps its name and path rules,
+ * and clears `unpairedAt` (`next` never carries one).
+ */
+function upsertWorker(existing: PairedWorker[], next: PairedWorker): PairedWorker[] {
+  const old = existing.find((w) => w.nodeId === next.nodeId);
+  const merged: PairedWorker = old
+    ? { ...next, label: old.label, pathRules: old.pathRules ?? next.pathRules }
+    : next;
+  return [...existing.filter((w) => w.nodeId !== next.nodeId), merged];
+}
+
+/** How long Forget waits to unpair this device on the worker before giving up. */
+const FORGET_LEAVE_TIMEOUT_MS = 5000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** `clients.leave` on `worker`: over `live` if given, else a one-off dial (closed after). */
+async function leaveWorker(worker: PairedWorker, live: WorkerClient | null): Promise<void> {
+  if (live) {
+    await live.clientsLeave();
+    return;
+  }
+  const client = await dialWorker(worker, resolvePreferredTransport(worker));
+  try {
+    await client.clientsLeave();
+  } finally {
+    client.close();
+  }
+}
+
+/** Shown wherever a worker refused this device as no longer paired. */
+export const UNPAIRED_MESSAGE =
+  "This device was unpaired by the worker. Pair again with a new code from 'sleap-connect pair'.";
+
+/**
+ * Fetches every entry in a directory, paginating via `fetchPage` (one
+ * `fs.list(path, offset)` call) until `hasMore` is false (or a safety cap of
+ * ~5000 entries is hit). Shared by `browseRemoteDir` (selected worker —
+ * `fetchPage` re-checks `_client` on every page, exactly as it always did,
+ * so a disconnect mid-pagination still fails the same way) and
+ * `browseRemoteDirOn` (any paired worker, one `client` dialed via
+ * `clientFor` up front) — the two differ only in how a page is fetched,
+ * never in how the pages are walked.
+ */
+async function fetchAllRemoteEntries(
+  fetchPage: (offset: number) => Promise<FsListResult>,
+  offset = 0,
+  limit = Infinity,
+): Promise<FileEntry[]> {
+  const allEntries: FileEntry[] = [];
+  let currentOffset = offset;
+  const MAX_PAGES = 200; // safety cap (200 pages * ~25 = ~5000 entries)
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const result = await fetchPage(currentOffset);
+    const entries: FileEntry[] = result.entries.map((e) => ({
+      name: e.name,
+      isDir: e.type === "directory",
+      size: e.size,
+      modified: e.modified,
+    }));
+    allEntries.push(...entries);
+    if (!result.hasMore || entries.length === 0 || allEntries.length >= limit) break;
+    currentOffset += entries.length;
+  }
+
+  return allEntries;
+}
+
+function activeJobsFor(workerId: string, jobs: TrackedJob[]): TrackedJob[] {
+  return jobs.filter((j) => j.workerId === workerId && j.state === "active");
+}
+
+/** The most recently submitted still-active job on a worker, or `null`. */
+function latestActiveJobFor(workerId: string, jobs: TrackedJob[]): TrackedJob | null {
+  const active = activeJobsFor(workerId, jobs);
+  return active.length > 0 ? active[active.length - 1] : null;
+}
+
+/**
+ * What the training panel's Stop Early / Cancel act on: run `runId` if
+ * given (the panel's own run), else the run of the latest active tracked job.
+ * A split multi-model run is N sequential jobs sharing
+ * `run.id`, so `all` is every unfinished job in it (Cancel ends them all) and
+ * `current` is the one in progress (Stop Early ends only that model, and the
+ * next one still trains, like local training and SLEAP). Without the worker's
+ * job list (`summaries` empty) both fall back to the latest job. Exported for
+ * direct unit testing.
+ */
+export function runJobsToEnd(
+  latest: TrackedJob,
+  active: TrackedJob[],
+  summaries: JobSummary[],
+  wantedRunId?: string,
+): { all: string[]; current: string } {
+  const byId = new Map(summaries.map((s) => [s.jobId, s]));
+  const runId = wantedRunId ?? byId.get(latest.jobId)?.run?.id;
+  if (!runId) return { all: [latest.jobId], current: latest.jobId };
+  const siblings = active
+    .map((j) => byId.get(j.jobId))
+    .filter(
+      (s): s is JobSummary =>
+        s !== undefined &&
+        s.run?.id === runId &&
+        (s.state === "queued" || s.state === "running"),
+    )
+    .sort((a, b) => (a.run?.index ?? 0) - (b.run?.index ?? 0));
+  if (siblings.length === 0) return { all: [latest.jobId], current: latest.jobId };
+  const current = siblings.find((s) => s.state === "running") ?? siblings[0];
+  return { all: siblings.map((s) => s.jobId), current: current.jobId };
+}
+
+const MAX_TRACKED_JOBS = 50;
+
+/**
+ * Stop Early / Cancel for the selected worker's current run (see
+ * `runJobsToEnd`). A failure gets a toast: the panel already logged
+ * "Stop Early requested", so a silent failure would leave it waiting.
+ */
+async function endCurrentRun(mode: "cancel" | "stop", runId?: string): Promise<void> {
+  const store = useConnectStore.getState();
+  const { _client, selectedWorkerId, trackedJobs } = store;
+  if (!_client || !selectedWorkerId) return;
+  const active = activeJobsFor(selectedWorkerId, trackedJobs);
+  const latest = active[active.length - 1];
+  if (!latest) return;
+  let summaries: JobSummary[] = [];
+  try {
+    summaries = await store.listJobs(selectedWorkerId);
+  } catch {
+    // Unknown run membership: act on the latest job alone.
+  }
+  const { all, current } = runJobsToEnd(latest, active, summaries, runId);
+  for (const jobId of mode === "stop" ? [current] : all) {
+    try {
+      await store.cancelJobOn(selectedWorkerId, jobId, mode);
+    } catch (err) {
+      const { toast } = await import("@/lib/notify");
+      toast.error(mode === "stop" ? "Couldn't stop training" : "Couldn't cancel training", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+  }
+}
+
+/**
+ * Caps the list at `MAX_TRACKED_JOBS`, oldest-first among non-active jobs
+ * only — an active job is never evicted just to make room (if active jobs
+ * alone exceed the cap, the list is left over-length rather than dropping
+ * something still running). Exported for direct unit testing.
+ */
+export function capTrackedJobs(jobs: TrackedJob[]): TrackedJob[] {
+  let excess = jobs.length - MAX_TRACKED_JOBS;
+  if (excess <= 0) return jobs;
+  const dropIdx = new Set<number>();
+  const byAge = jobs
+    .map((j, i) => ({ j, i }))
+    .filter(({ j }) => j.state !== "active")
+    .sort((a, b) => a.j.submittedAt - b.j.submittedAt);
+  for (const { i } of byAge) {
+    if (excess <= 0) break;
+    dropIdx.add(i);
+    excess--;
+  }
+  return jobs.filter((_, i) => !dropIdx.has(i));
+}
+
+/** A paired worker's path rules (Locate-on-worker overrides + the one-time legacy import), or `[]` if unknown/unset. */
+export function pathRulesFor(workerId: string | null): PathMapping[] {
+  if (!workerId) return [];
+  return useConnectStore.getState().pairedWorkers.find((w) => w.nodeId === workerId)?.pathRules ?? [];
+}
+
+/** A tracked job's display label, derived from the spec that submitted it. */
+function trackedJobLabel(spec: JobSpec): string {
+  return spec.type === "track" ? "Inference" : `Train ${spec.model_types?.[0] ?? "model"}`;
+}
+
+/**
+ * Migrates persisted state from before `trackedJobs` existed (v1, a single
+ * `currentJob: {workerId, jobId} | null`) to v2's `TrackedJob[]`. Exported
+ * for direct unit testing — the real `migrate` persist option below just
+ * calls this.
+ */
+export function migrateConnectPersisted(persisted: unknown, version: number): unknown {
+  const p = { ...(persisted as Record<string, unknown>) };
+  if (version < 2) {
+    const cj = p.currentJob as { workerId: string; jobId: string } | null | undefined;
+    p.trackedJobs = cj
+      ? [
+          {
+            ...cj,
+            lastSeq: 0,
+            kind: "train" as const,
+            label: "Remote job",
+            source: "window" as const,
+            state: "active" as const,
+            seen: false,
+            submittedAt: Date.now(),
+          },
+        ]
+      : [];
+    delete p.currentJob;
+  }
+  if (version < 3) {
+    // The selection became per window; the shared copy only remembers the last one.
+    p.lastSelectedWorkerId = p.selectedWorkerId ?? null;
+    delete p.selectedWorkerId;
+  }
+  return p;
+}
+
+function isMultiModelTrainSpec(
+  spec: JobSpec,
+): spec is TrainJobSpec & { config_contents: string[] } {
+  return (
+    spec.type === "train" &&
+    Array.isArray(spec.config_contents) &&
+    spec.config_contents.length > 1
+  );
+}
+
+/**
+ * Copies a single-config train job's YAML `trainer_config.run_name` onto the
+ * spec's `run_name`. Without it the worker falls back to the model type and
+ * passes `trainer_config.run_name=<model_type>` on the sleap-nn command line,
+ * which overrides the YAML and drops the `<ts>.<model>.n=<N>` name this app
+ * resolved (sleap-connect `jobs/builder.py`'s `build_train_command`). The
+ * worker interpolates the value unquoted, so it's sent Hydra-quoted — the `=`
+ * in `n=<N>` is otherwise an override parse error — the same quoting local
+ * training applies (`trainingArgs.ts`). Applied to each job as it's sent, so
+ * it holds after a multi-model spec is split. An explicit `run_name` is never
+ * overridden.
+ */
+export function withYamlRunName(spec: JobSpec): JobSpec {
+  if (spec.type !== "train" || spec.run_name || spec.config_contents?.length !== 1) return spec;
+  try {
+    const parsed = yaml.load(spec.config_contents[0]) as
+      | { trainer_config?: { run_name?: unknown } }
+      | null
+      | undefined;
+    const runName = parsed?.trainer_config?.run_name;
+    return typeof runName === "string" && runName ? { ...spec, run_name: hydraQuote(runName) } : spec;
+  } catch {
+    return spec;
+  }
+}
+
+/** What to dial: `url` is a ws address, or the encoded iroh target for `"iroh"`. */
+interface DialSpec {
+  transport: TransportKind;
+  url: string;
+  /** Human-readable address for error messages. */
+  display: string;
+}
+
+/** ws is the implicit default, so only a non-default choice is persisted on the worker. */
+function rememberedTransport(t: TransportKind): TransportKind | undefined {
+  return t === "iroh" ? "iroh" : undefined;
+}
+
+const IROH_DESKTOP_ONLY =
+  "Connecting over the internet needs the desktop app — in the browser, use the worker's network address.";
+
+async function irohDial(info: IrohEndpointInfo | undefined, nodeId: string): Promise<DialSpec> {
+  if (!irohTransportAvailable()) throw new Error(IROH_DESKTOP_ONLY);
+  if (!info) {
+    throw new Error(
+      "This worker's code has no internet connection info — run sleap-connect pair again while it's running, or use its network address.",
+    );
+  }
+  const { encodeIrohDialUrl } = await import("@/lib/protocolV1/tauriIrohSocket");
+  const target = toIrohDialTarget(info, nodeId);
+  return {
+    transport: "iroh",
+    url: encodeIrohDialUrl(target),
+    display: `iroh endpoint ${target.nodeId.slice(0, 8)}…`,
+  };
+}
+
+/** localStorage key the connect store persists under. */
+const CONNECT_STORAGE_KEY = "sleap-app-connect";
+const CONNECT_PERSIST_VERSION = 3;
+/** sessionStorage key for this window's selected worker (`""` = none chosen). */
+const SELECTED_WORKER_SESSION_KEY = "sleap-app-connect-selected";
+
+/**
+ * The shared copy this window last read or wrote — the `base` of every
+ * three-way merge (`mergeShared`). `null` until this window has read a
+ * current-version copy, so its first save unions instead of deleting.
+ */
+let sharedBase: SharedConnectState | null = null;
+
+function sharedSlice(state: ConnectState): SharedConnectState {
+  return {
+    pairedWorkers: state.pairedWorkers,
+    trackedJobs: state.trackedJobs,
+    deviceName: state.deviceName,
+    lastSelectedWorkerId: state.lastSelectedWorkerId,
+  };
+}
+
+/** A persisted state's shared fields, or `null` if it isn't shaped like one. */
+function toShared(state: unknown): SharedConnectState | null {
+  const p = state as Partial<SharedConnectState> | null;
+  if (!p || !Array.isArray(p.pairedWorkers) || !Array.isArray(p.trackedJobs)) return null;
+  return {
+    pairedWorkers: p.pairedWorkers,
+    trackedJobs: p.trackedJobs,
+    deviceName: typeof p.deviceName === "string" ? p.deviceName : null,
+    lastSelectedWorkerId: typeof p.lastSelectedWorkerId === "string" ? p.lastSelectedWorkerId : null,
+  };
+}
+
+/** Parses a raw stored value (any version) into the current shared shape. */
+function readStoredShared(raw: string | null): SharedConnectState | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as StorageValue<unknown>;
+    const version = parsed.version ?? 0;
+    const state =
+      version < CONNECT_PERSIST_VERSION ? migrateConnectPersisted(parsed.state, version) : parsed.state;
+    return toShared(state);
+  } catch {
+    return null;
+  }
+}
+
+function capShared(s: SharedConnectState): SharedConnectState {
+  return { ...s, trackedJobs: capTrackedJobs(s.trackedJobs) };
+}
+
+function localStore(): Storage | null {
+  try {
+    return typeof localStorage !== "undefined" ? localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+/** This window's saved selection: a worker id, `null` = deliberately none, `undefined` = never chosen here. */
+function readSessionSelection(): string | null | undefined {
+  try {
+    const v = sessionStorage.getItem(SELECTED_WORKER_SESSION_KEY);
+    return v === null ? undefined : v || null;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeSessionSelection(id: string | null): void {
+  try {
+    sessionStorage.setItem(SELECTED_WORKER_SESSION_KEY, id ?? "");
+  } catch {
+    // No sessionStorage: the selection just won't survive a reload.
+  }
+}
+
+/**
+ * Puts a merged shared state into this window's store, and undoes locally
+ * whatever another window's change implies: a worker it forgot is
+ * disconnected here too (without `clients.leave` — the forgetting window
+ * already told the worker), and a new device name is pushed to this window's
+ * connected workers.
+ */
+function applyShared(merged: SharedConnectState): void {
+  const before = useConnectStore.getState();
+  const kept = new Set(merged.pairedWorkers.map((w) => w.nodeId));
+  const removed = before.pairedWorkers.filter((w) => !kept.has(w.nodeId)).map((w) => w.nodeId);
+  useConnectStore.setState(merged);
+  for (const nodeId of removed) dropWorkerLocally(nodeId);
+  if (merged.deviceName && merged.deviceName !== before.deviceName) {
+    void pushDeviceNameToConnected(merged.deviceName);
+  }
+}
+
+/** Stops this window's connection to a worker another window forgot, and deselects it. */
+function dropWorkerLocally(nodeId: string): void {
+  const mc = managed.get(nodeId);
+  managed.delete(nodeId);
+  mc?.stop();
+  const state = useConnectStore.getState();
+  const wasSelected = state.selectedWorkerId === nodeId;
+  if (wasSelected && state._client && state._client !== mc?.client) state._client.close();
+  useConnectStore.setState((s) => ({
+    connections: Object.fromEntries(Object.entries(s.connections).filter(([id]) => id !== nodeId)),
+    ...(wasSelected
+      ? {
+          selectedWorkerId: null,
+          connectionStatus: "disconnected" as ConnectionStatus,
+          connectionError: null,
+          workerMounts: [],
+          reattachableJob: null,
+          activeTransport: null,
+          _client: null,
+        }
+      : {}),
+  }));
+}
+
+/**
+ * The `persist` storage: every save is a three-way merge into the stored
+ * copy (`mergeShared`) instead of an overwrite, so a stale window can't undo
+ * another window's pairings, forgets, path rules or tracked jobs (#453). If
+ * the merge brought in another window's changes, they're applied to this
+ * window's store too.
+ */
+const sharedConnectStorage: PersistStorage<SharedConnectState> = {
+  getItem: (name) => {
+    const raw = localStore()?.getItem(name) ?? null;
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as StorageValue<SharedConnectState>;
+      if (parsed.version === CONNECT_PERSIST_VERSION) sharedBase = toShared(parsed.state);
+      return parsed;
+    } catch {
+      return null;
+    }
+  },
+  setItem: (name, value) => {
+    const storage = localStore();
+    if (!storage) return;
+    const mine = toShared(value.state);
+    if (!mine) return;
+    const stored = storage.getItem(name);
+    const theirs = readStoredShared(stored);
+    const merged = theirs ? capShared(mergeShared(sharedBase, mine, theirs)) : mine;
+    sharedBase = merged;
+    const raw = JSON.stringify({ state: merged, version: value.version });
+    // Skipping an unchanged write also spares the other windows a storage event.
+    if (raw !== stored) storage.setItem(name, raw);
+    if (!sameShared(merged, mine)) queueMicrotask(() => applyShared(merged));
+  },
+  removeItem: (name) => {
+    localStore()?.removeItem(name);
+    sharedBase = null;
+  },
+};
+
+let _defaultDeviceName: Promise<string> | null = null;
+
+/** This device's name for workers: the user's choice, else the OS/browser default (looked up once). */
+export async function resolveDeviceName(): Promise<string> {
+  const chosen = useConnectStore.getState().deviceName;
+  if (chosen) return chosen;
+  _defaultDeviceName ??= defaultDeviceName();
+  return _defaultDeviceName;
+}
+
+/** `clients.rename` on every worker this tab/window is connected to (best effort). */
+async function pushDeviceNameToConnected(name: string): Promise<void> {
+  await Promise.all(
+    [...managed.values()].map(async (mc) => {
+      const client = mc.client;
+      if (!client?.authenticated) return;
+      try {
+        await client.clientsRename(name);
+      } catch (err) {
+        // An older worker without clients.rename still learns it on the next hello.
+        console.warn("[connect] clients.rename failed:", err);
+      }
+    }),
+  );
+}
+
+async function makeClient(dial: DialSpec): Promise<WorkerClient> {
+  const { getClientIdentity } = await import("@/lib/protocolV1/identity");
+  const { WorkerClient: WorkerClientCtor } = await import("@/lib/protocolV1/client");
+  const identity = await getClientIdentity();
+  // Sent in every hello, so a reconnect always carries the current name.
+  const agent: AgentInfo = { ...AGENT_INFO, device_name: await resolveDeviceName() };
+  if (dial.transport === "iroh") {
+    const { createTauriIrohSocket } = await import("@/lib/protocolV1/tauriIrohSocket");
+    return new WorkerClientCtor({
+      url: dial.url,
+      identity,
+      agent,
+      createSocket: createTauriIrohSocket(),
+    });
+  }
+  return new WorkerClientCtor({ url: dial.url, identity, agent });
+}
+
+/**
+ * Dials, verifies, and authenticates against an already-paired worker over
+ * `route` — the `ManagedConnectionDeps.dial` this store hands every
+ * `ManagedConnection` it creates (§2b.4), and what `connectToWorker`'s
+ * initial connect also goes through. Closes the client and re-throws on any
+ * failure after the socket opened, so a caller never has to (a half-open
+ * client is never left dangling, reachable by nothing).
+ */
+async function dialWorker(worker: PairedWorker, route: TransportKind): Promise<WorkerClient> {
+  const dial: DialSpec =
+    route === "iroh"
+      ? await irohDial(worker.iroh, worker.nodeId)
+      : (() => {
+          const addr = worker.addrs[0];
+          if (!addr) throw new Error(`No known address for ${worker.label}.`);
+          return { transport: "ws" as const, url: addr, display: addr };
+        })();
+
+  const client = await makeClient(dial);
+  try {
+    await client.connect();
+    if (client.peerNodeId !== worker.nodeId) {
+      throw new Error(
+        `Worker at ${dial.display} identified itself as a different node than expected ` +
+          `(expected ${worker.nodeId}, got ${client.peerNodeId}) — the address may now point ` +
+          "at a different worker. Forget and re-pair if this persists.",
+      );
+    }
+    await client.authProve();
+    return client;
+  } catch (err) {
+    client.close();
+    // Same code (so `isUnpairedError` still matches), friendlier words than
+    // the worker's "Node '<id>' is not paired with this worker".
+    if (isUnpairedError(err)) throw new WorkerProtocolError(AUTH_UNTRUSTED, UNPAIRED_MESSAGE);
+    throw err;
+  }
+}
+
+/** Explicit if given, else the worker's own remembered preference (never a route arrived at only via an automatic fallback). */
+function resolvePreferredTransport(worker: PairedWorker, options?: ConnectOptions): TransportKind {
+  return (
+    options?.transport ??
+    (worker.transport === "iroh" && worker.iroh && irohTransportAvailable() ? "iroh" : "ws")
+  );
+}
+
+function mapLinkStatus(status: LinkStatus): ConnectionStatus {
+  switch (status) {
+    case "connected":
+      return "connected";
+    case "reconnecting":
+    case "offline":
+      return "reconnecting";
+    case "connecting":
+      return "connecting";
+    case "stopped":
+      return "disconnected";
+    case "unpaired":
+      return "error";
+  }
+}
+
+/** One `ManagedConnection` per worker that's selected or has an active tracked job. */
+const managed = new Map<string, ManagedConnection>();
+
+/** `clientFor`'s in-flight initial dials, so concurrent calls for one worker share a single `start()`. */
+const clientForStarts = new Map<string, Promise<WorkerClient>>();
+
+interface ManagedConnectionTestDeps {
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+let managedDeps: ManagedConnectionTestDeps = {};
+
+/** Test-only hook: inject a fake clock into every `ManagedConnection` this store creates from here on. */
+export function __setManagedDeps(deps: ManagedConnectionTestDeps): void {
+  managedDeps = deps;
+}
+
+/**
+ * Test-only: stops and drops every managed connection. `managed` is
+ * module-level state that outlives any one test within a file (bun's
+ * `--isolate` resets the module registry per FILE, not per test) — without
+ * this, a connection a test deliberately left running in the background
+ * (e.g. disconnect-with-an-active-job) would keep its retry/probe loop alive
+ * into later tests in the same file.
+ */
+export function __resetManagedConnections(): void {
+  for (const mc of managed.values()) mc.stop();
+  managed.clear();
+  clientForStarts.clear();
+}
+
+/**
+ * Gets (or lazily creates) the `ManagedConnection` for `nodeId`, wiring its
+ * status/connected callbacks into the store. Creating one does NOT dial —
+ * the caller still calls `.start()` (or, per `ManagedConnection`'s own
+ * contract, reuses `.client` if already connected).
+ */
+function ensureConnection(nodeId: string, options?: ConnectOptions): ManagedConnection {
+  const existing = managed.get(nodeId);
+  if (existing) return existing;
+
+  const worker = useConnectStore.getState().pairedWorkers.find((w) => w.nodeId === nodeId);
+  if (!worker) {
+    throw new Error("Unknown worker — pair with it first.");
+  }
+
+  const mc = new ManagedConnection({
+    dial: (route) => dialWorker(worker, route),
+    preferredRoute: resolvePreferredTransport(worker, options),
+    canFallBackToIroh: !!worker.iroh && irohTransportAvailable(),
+    onStatus: (status, route) => {
+      // A forgotten worker's connection can still report in while Forget
+      // tells the worker (`clients.leave`) — it's no longer ours to track.
+      if (!useConnectStore.getState().pairedWorkers.some((w) => w.nodeId === nodeId)) return;
+      useConnectStore.setState((state) => {
+        const patch: Partial<ConnectState> = {
+          connections: { ...state.connections, [nodeId]: { status, route } },
+        };
+        if (status === "unpaired") {
+          patch.pairedWorkers = state.pairedWorkers.map((w) =>
+            w.nodeId === nodeId && !w.unpairedAt
+              ? { ...w, unpairedAt: new Date().toISOString() }
+              : w,
+          );
+        }
+        if (nodeId === state.selectedWorkerId) {
+          patch.connectionStatus = mapLinkStatus(status);
+          patch.connectionError =
+            status === "offline"
+              ? "Worker unreachable — retrying"
+              : status === "unpaired"
+                ? UNPAIRED_MESSAGE
+                : null;
+          patch.activeTransport = route;
+          if (status === "unpaired") patch._client = null;
+        }
+        return patch;
+      });
+      // Stopped for good: drop it so a later explicit connect builds a fresh one.
+      if (status === "unpaired" && managed.get(nodeId) === mc) managed.delete(nodeId);
+    },
+    onConnected: (client, route) => {
+      if (nodeId === useConnectStore.getState().selectedWorkerId) {
+        useConnectStore.setState({ _client: client, activeTransport: route });
+        // Best-effort: keeps `workerMounts` current across an automatic
+        // reconnect the selected-worker UI didn't otherwise ask for. The
+        // EXPLICIT connectToWorker flow below does its own awaited fetch for
+        // deterministic UI state right when "connected" first appears.
+        void client
+          .fsMounts()
+          .then((mounts) => useConnectStore.setState({ workerMounts: mounts }))
+          .catch(() => {});
+      }
+      // Always — even for a worker that isn't selected, a background job
+      // still needs its subscription re-attached to the new client.
+      resubscribeWorker(nodeId, client);
+    },
+    now: managedDeps.now,
+    sleep: managedDeps.sleep,
+  });
+  managed.set(nodeId, mc);
+  return mc;
+}
+
+/**
+ * If `trackedJob` belongs to `workerId` (the worker we just connected to)
+ * and is still active there, returns it as a `ReattachableJob`; otherwise
+ * `null` (nothing to reattach to — wrong worker, already finished, or the
+ * worker no longer recognizes the job at all).
+ */
+async function checkReattach(
+  client: WorkerClient,
+  workerId: string,
+  trackedJob: TrackedJob | null,
+): Promise<ReattachableJob | null> {
+  if (!trackedJob || trackedJob.workerId !== workerId) return null;
+  try {
+    const status = await client.jobsStatus(trackedJob.jobId);
+    if (TERMINAL_JOB_STATES.has(status.state)) return null;
+    return { jobId: trackedJob.jobId, state: status.state };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One job's live event subscription, tracked at module level (NOT persisted
+ * — it's rebuilt fresh every session) so a reconnect can re-attach it to a
+ * new `WorkerClient` without the submitting `submitJob` promise ever
+ * knowing its connection was replaced underneath it. Keyed by `jobId`.
+ */
+interface ActiveSubscription {
+  workerId: string;
+  jobId: string;
+  handle: (event: WorkerEvent) => void;
+  unsubscribe: (() => void) | null;
+}
+const activeSubscriptions = new Map<string, ActiveSubscription>();
+
+/** (Re)subscribes `sub` on `client` starting from `sinceSeq`, dropping any prior subscription first. */
+async function attachSubscription(
+  client: WorkerClient,
+  sub: ActiveSubscription,
+  sinceSeq: number,
+): Promise<void> {
+  sub.unsubscribe?.();
+  sub.unsubscribe = await client.jobsSubscribe(sub.jobId, sinceSeq, sub.handle);
+}
+
+/** The persisted `lastSeq` for one tracked job — the catch-up point after a reconnect. */
+function trackedLastSeq(jobId: string): number {
+  return useConnectStore.getState().trackedJobs.find((j) => j.jobId === jobId)?.lastSeq ?? 0;
+}
+
+/**
+ * Re-attaches every active subscription belonging to `workerId` onto a newly
+ * (re)connected `client`, resuming each from its last-applied seq. Called by
+ * `ManagedConnection`'s `onConnected` (§2b.4) for every reconnect/route
+ * switch, not just the selected worker's — a background job on an
+ * unselected-but-tracked worker still needs to keep receiving events.
+ */
+export function resubscribeWorker(workerId: string, client: WorkerClient): void {
+  for (const sub of activeSubscriptions.values()) {
+    if (sub.workerId !== workerId) continue;
+    void attachSubscription(client, sub, trackedLastSeq(sub.jobId));
+  }
+}
+
+type ConnectSet = (
+  partial: Partial<ConnectState> | ((state: ConnectState) => Partial<ConnectState>),
+) => void;
+
+/** Merges `patch` into one tracked job by `jobId`, leaving every other job untouched. */
+function updateTrackedJob(set: ConnectSet, jobId: string, patch: Partial<TrackedJob>): void {
+  set((state) => ({
+    trackedJobs: state.trackedJobs.map((j) => (j.jobId === jobId ? { ...j, ...patch } : j)),
+  }));
+}
+
+/**
+ * Jobs already toasted this session — `resumeTrackedJobs` (§2b.5) can run
+ * more than once (e.g. called again before a prior run's awaits settle) and
+ * must never show the same "finished"/"failed" toast twice for one job.
+ */
+const notifiedJobIds = new Set<string>();
+
+/**
+ * Toasts that `job` reached a terminal state, once per job ever. Dynamically
+ * imports `@/lib/notify` rather than a static import — same reason as
+ * `makeClient`'s dynamic imports above: this module is statically imported
+ * by connectStore's own tests, so a static import here would bind the real
+ * `toast` before a test's `vi.mock("@/lib/notify", ...)` ever got a chance
+ * to replace it. `toast.success`/`toast.error`/`toast.info` already feed the
+ * sidebar's notification bell (see `src/lib/notify.tsx`) — no separate call
+ * needed. A canceled job is the user's own action, not a failure — it gets
+ * the neutral `info` toast, never `error`.
+ */
+async function notifyJobFinished(
+  job: TrackedJob,
+  workerLabel: string,
+  errorDetail?: string | null,
+): Promise<void> {
+  if (notifiedJobIds.has(job.jobId)) return;
+  notifiedJobIds.add(job.jobId);
+  const { toast } = await import("@/lib/notify");
+  const { useAppStore } = await import("@/stores/appStore");
+  // Replaces the toast's usual hover copy-button (`@/lib/notify`'s default
+  // `action`) with a one-click path to the Connect window (PR4b §4b.2).
+  const action = {
+    label: "Open",
+    onClick: () => useAppStore.getState().setConnectWindowOpen(true),
+  };
+  if (job.state === "completed") {
+    toast.success(`${job.label} on ${workerLabel} finished`, { action });
+  } else if (job.state === "canceled") {
+    toast.info(`${job.label} on ${workerLabel} was canceled`, { action });
+  } else {
+    toast.error(`${job.label} on ${workerLabel} failed`, {
+      description: errorDetail ?? undefined,
+      action,
+    });
+  }
+}
+
+/**
+ * Watches one tracked job to a terminal state without ever resolving a
+ * caller's own promise — unlike `submitSingleJob`, nothing here awaits the
+ * job finishing. Updates `trackedJobs.lastSeq` as events arrive, and once a
+ * terminal `job.status` lands, records the final state and fires
+ * `notifyJobFinished` (deduped there, so re-watching an already-finished job
+ * is harmless). Shared by `resumeTrackedJobs` (a job found still active from
+ * a previous session) and `submitJobsOn` (a job this window just submitted
+ * and isn't waiting on) — extracted from the former so the two never drift.
+ *
+ * `onChainedJobIds` fires when a `job.result` event carries
+ * `chained_job_ids` — only ever set by a train job's own post-train
+ * chaining (sleap-connect PR5w) — letting `submitJobsOn` start tracking and
+ * watching those track jobs too, so their own finish toasts fire even
+ * though this window never submitted them itself.
+ */
+async function watchTrackedJob(
+  set: ConnectSet,
+  client: WorkerClient,
+  job: TrackedJob,
+  workerLabel: string,
+  onChainedJobIds?: (ids: string[]) => void,
+): Promise<void> {
+  if (activeSubscriptions.has(job.jobId)) return; // already being watched
+
+  let watcherLastSeq = job.lastSeq;
+  const watcher: ActiveSubscription = {
+    workerId: job.workerId,
+    jobId: job.jobId,
+    unsubscribe: null,
+    handle: (event) => {
+      if (event.seq <= watcherLastSeq) return;
+      watcherLastSeq = event.seq;
+      updateTrackedJob(set, job.jobId, { lastSeq: watcherLastSeq });
+
+      if (event.topic === "job.result") {
+        const chainedIds = event.data.chained_job_ids as string[] | undefined;
+        if (chainedIds && chainedIds.length > 0) onChainedJobIds?.(chainedIds);
+        return;
+      }
+      if (event.topic !== "job.status") return;
+      const state = event.data.state as string;
+      if (!TERMINAL_JOB_STATES.has(state)) return;
+      watcher.unsubscribe?.();
+      activeSubscriptions.delete(job.jobId);
+      const trackedState = state as TrackedJob["state"];
+      const detail = (event.data.detail as string) ?? null;
+      updateTrackedJob(set, job.jobId, {
+        state: trackedState,
+        ...(trackedState !== "completed" ? { error: detail ?? undefined } : {}),
+      });
+      void notifyJobFinished({ ...job, state: trackedState }, workerLabel, detail);
+    },
+  };
+  activeSubscriptions.set(job.jobId, watcher);
+  try {
+    await attachSubscription(client, watcher, job.lastSeq);
+  } catch (err) {
+    activeSubscriptions.delete(job.jobId);
+    console.warn(`[connect] watchTrackedJob: failed to watch job ${job.jobId}:`, err);
+  }
+}
+
+/**
+ * Starts tracking and watching one job the WORKER produced on its own — a
+ * chained post-train inference job (`chained_job_ids`, PR5w) this window
+ * never called `jobsSubmit` for — so it shows up in the Connect window and
+ * its own finish toast still fires. A no-op if `jobId` is already tracked
+ * (e.g. a worker-file job scan discovers it independently).
+ */
+function trackChainedJob(
+  set: ConnectSet,
+  client: WorkerClient,
+  workerId: string,
+  jobId: string,
+  source: TrackedJob["source"],
+  workerLabel: string,
+): void {
+  if (useConnectStore.getState().trackedJobs.some((j) => j.jobId === jobId)) return;
+  const job: TrackedJob = {
+    workerId,
+    jobId,
+    lastSeq: 0,
+    kind: "track",
+    label: "Inference",
+    source,
+    state: "active",
+    seen: false,
+    submittedAt: Date.now(),
+  };
+  set((state) => ({ trackedJobs: capTrackedJobs([...state.trackedJobs, job]) }));
+  void watchTrackedJob(set, client, job, workerLabel);
+}
+
+const LAST_SEQ_PERSIST_THROTTLE_MS = 2000;
+
+/**
+ * Submits one job and resolves once it reaches a terminal state, forwarding
+ * `job.log` lines to `onProgress` as they arrive. The subscription survives
+ * a reconnect (registered in `activeSubscriptions`, re-attached by
+ * `resubscribeWorker`): `since_seq: 0` is safe for the very first subscribe
+ * since there's no backlog yet, and every event is deduped by seq so a
+ * reconnect's backlog replay can never double-apply one already seen live.
+ */
+async function submitSingleJob(
+  client: WorkerClient,
+  workerId: string,
+  spec: JobSpec,
+  onProgress: JobLogHandler,
+  set: ConnectSet,
+  onTelemetry?: (telemetry: JobTelemetry) => void,
+): Promise<JobResult> {
+  const { jobId } = await client.jobsSubmit(withYamlRunName(spec) as unknown as Record<string, unknown>);
+  const tracked: TrackedJob = {
+    workerId,
+    jobId,
+    lastSeq: 0,
+    kind: spec.type,
+    label: trackedJobLabel(spec),
+    source: "window",
+    state: "active",
+    seen: false,
+    submittedAt: Date.now(),
+  };
+  set((state) => ({ trackedJobs: capTrackedJobs([...state.trackedJobs, tracked]) }));
+
+  return new Promise<JobResult>((resolve, reject) => {
+    let settled = false;
+    // job.result arrives before job.status: completed (the worker emits
+    // them in that order specifically so this is never missed) — captured
+    // here so it's already in hand by the time `finish` resolves.
+    let resultBlobs: JobResult["resultBlobs"];
+    let modelDir: string | undefined;
+    let labelsPath: string | undefined;
+    let lastSeq = 0;
+    let lastPersistedAt = 0;
+
+    // Throttled so a fast stream of job.log/telemetry events doesn't write
+    // to the store on every single one; always caught up on terminal below.
+    const persistLastSeq = () => {
+      const now = Date.now();
+      if (now - lastPersistedAt < LAST_SEQ_PERSIST_THROTTLE_MS) return;
+      lastPersistedAt = now;
+      updateTrackedJob(set, jobId, { lastSeq });
+    };
+
+    const finish = (result: JobResult, trackedState: TrackedJob["state"]) => {
+      if (settled) return;
+      settled = true;
+      sub.unsubscribe?.();
+      activeSubscriptions.delete(jobId);
+      // Keep the tracked entry (it's the Connect window's job history) and
+      // just record its terminal state, rather than clearing it the way the
+      // old single-slot `currentJob` did. `seen: true` here because this
+      // window is live and watching it finish; resume-on-launch's toast
+      // (§2b.5) only fires for a job that reaches terminal while unwatched.
+      updateTrackedJob(set, jobId, {
+        state: trackedState,
+        seen: true,
+        lastSeq,
+        ...(trackedState !== "completed" ? { error: result.error } : {}),
+      });
+      resolve(result);
+    };
+
+    const sub: ActiveSubscription = {
+      workerId,
+      jobId,
+      unsubscribe: null,
+      handle: (event) => {
+        // The worker's `since_seq` is exclusive, but a live event can still
+        // arrive both live (before a drop) and again in a reconnect's
+        // backlog replay — drop anything already applied.
+        if (event.seq <= lastSeq) return;
+        lastSeq = event.seq;
+        persistLastSeq();
+
+        if (event.topic === "job.log") {
+          onProgress((event.data.line as string) ?? "", event.data.progress === true);
+        } else if (event.topic === "job.result") {
+          const blobs = event.data.blobs as Record<string, JobResultBlobRef> | undefined;
+          if (blobs && Object.keys(blobs).length > 0) resultBlobs = blobs;
+          // Train jobs only: the trained model folder + the labels file it
+          // trained on, both worker-side paths (inputs to a follow-up track job).
+          if (typeof event.data.model_dir === "string") modelDir = event.data.model_dir;
+          if (typeof event.data.labels_path === "string") labelsPath = event.data.labels_path;
+        } else if (event.topic === "job.status") {
+          const state = event.data.state as string;
+          if (state === "completed") {
+            const result: JobResult = { jobId, success: true, resultBlobs, runId: spec.run?.id };
+            if (modelDir !== undefined) result.modelDir = modelDir;
+            if (labelsPath !== undefined) result.labelsPath = labelsPath;
+            finish(result, "completed");
+          } else if (state === "failed" || state === "canceled") {
+            finish(
+              {
+                jobId,
+                success: false,
+                error: (event.data.detail as string) ?? `Job ${state}`,
+                runId: spec.run?.id,
+              },
+              state,
+            );
+          }
+        } else if (onTelemetry) {
+          const telemetry = parseJobTelemetry(event);
+          if (telemetry) onTelemetry(telemetry);
+        }
+      },
+    };
+
+    activeSubscriptions.set(jobId, sub);
+    attachSubscription(client, sub, 0).catch((err: unknown) => {
+      activeSubscriptions.delete(jobId);
+      if (!settled) {
+        settled = true;
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  });
+}
+
+// ── Store ─────────────────────────────────────────────────────────
+
+export const useConnectStore = create<ConnectState>()(
+  persist(
+    (set, get) => ({
+      pairedWorkers: [],
+      selectedWorkerId: null,
+      lastSelectedWorkerId: null,
+      trackedJobs: [],
+      deviceName: null,
+
+      connectionStatus: "disconnected",
+      connectionError: null,
+      workerMounts: [],
+      reattachableJob: null,
+      activeTransport: null,
+      connections: {},
+      workerErrors: {},
+      workerInfo: {},
+      _client: null,
+
+      clientFor: async (workerId) => {
+        const existing = managed.get(workerId);
+        if (existing?.client) return existing.client;
+        // Automatic callers (the Connect window's refresh, etc.) don't keep
+        // dialing a worker that has refused this device.
+        if (get().pairedWorkers.find((w) => w.nodeId === workerId)?.unpairedAt) {
+          throw new Error(UNPAIRED_MESSAGE);
+        }
+        // Concurrent callers (the Connect window fires info + jobs at once)
+        // share one dial — `start()` isn't idempotent and a second call would
+        // adopt a second client, leaking the first.
+        const pending = clientForStarts.get(workerId);
+        if (pending) return pending;
+        // A managed connection with no client and no start of ours in flight
+        // is either mid-reconnect (its own retry loop owns the redial) or
+        // mid-`connectToWorker`/`resumeTrackedJobs` start — dialing here too
+        // would race it. `connections[workerId]` already shows the status.
+        if (existing) throw new Error("Worker is reconnecting — try again shortly.");
+
+        const mc = ensureConnection(workerId);
+        const start = (async () => {
+          try {
+            const client = await mc.start();
+            set((state) => ({ workerErrors: { ...state.workerErrors, [workerId]: null } }));
+            return client;
+          } catch (err) {
+            if (managed.get(workerId) === mc) managed.delete(workerId);
+            set((state) => ({
+              workerErrors: {
+                ...state.workerErrors,
+                [workerId]: err instanceof Error ? err.message : String(err),
+              },
+            }));
+            throw err;
+          } finally {
+            clientForStarts.delete(workerId);
+          }
+        })();
+        clientForStarts.set(workerId, start);
+        return start;
+      },
+
+      releaseIdleConnections: () => {
+        const { selectedWorkerId, trackedJobs } = get();
+        for (const [workerId, mc] of [...managed]) {
+          if (workerId === selectedWorkerId) continue;
+          if (activeJobsFor(workerId, trackedJobs).length > 0) continue;
+          mc.stop();
+          managed.delete(workerId);
+        }
+      },
+
+      refreshWorkerInfo: async (workerId) => {
+        try {
+          const client = await get().clientFor(workerId);
+          const info = await client.workerInfo();
+          set((state) => ({
+            workerInfo: { ...state.workerInfo, [workerId]: info },
+            workerErrors: { ...state.workerErrors, [workerId]: null },
+          }));
+        } catch (err) {
+          set((state) => ({
+            workerErrors: {
+              ...state.workerErrors,
+              [workerId]: err instanceof Error ? err.message : String(err),
+            },
+          }));
+        }
+      },
+
+      listJobs: async (workerId) => {
+        const client = await get().clientFor(workerId);
+        return client.jobsList();
+      },
+
+      jobDetail: async (workerId, jobId) => {
+        const client = await get().clientFor(workerId);
+        return client.jobsStatus(jobId);
+      },
+
+      cancelJobOn: async (workerId, jobId, mode) => {
+        const client = await get().clientFor(workerId);
+        await client.jobsCancel(jobId, mode);
+      },
+
+      deleteJobsOn: async (workerId, jobIds) => {
+        const client = await get().clientFor(workerId);
+        await client.jobsDelete(jobIds);
+
+        const idSet = new Set(jobIds);
+        for (const jobId of jobIds) {
+          activeSubscriptions.get(jobId)?.unsubscribe?.();
+          activeSubscriptions.delete(jobId);
+          notifiedJobIds.delete(jobId);
+        }
+        set((state) => ({
+          trackedJobs: state.trackedJobs.filter((j) => !idSet.has(j.jobId)),
+        }));
+      },
+
+      pairWithTicket: async (ticketJson, addrOverride, options) => {
+        const trimmed = ticketJson.trim();
+        let ticket: PairingTicket;
+        if (isPairCode(trimmed)) {
+          try {
+            ticket = await decodePairCode(trimmed);
+          } catch (err) {
+            // Re-thrown as a plain Error (not PairCodeError) so callers that
+            // branch on `instanceof Error` for the message (PairWorkerForm)
+            // don't need to know about this module's error type.
+            throw new Error(err instanceof PairCodeError ? err.message : String(err));
+          }
+          if (ticket.expires_at !== undefined && ticket.expires_at * 1000 < Date.now()) {
+            throw new Error(
+              `This pairing code expired at ${new Date(ticket.expires_at * 1000).toLocaleString()}; ` +
+                "run `sleap-connect pair` again.",
+            );
+          }
+        } else {
+          try {
+            ticket = JSON.parse(trimmed);
+          } catch {
+            throw new Error("That doesn't look like a valid pairing ticket (invalid JSON).");
+          }
+        }
+        if (!ticket.node_id || !ticket.secret) {
+          throw new Error("Pairing ticket is missing node_id or secret.");
+        }
+        const irohInfo = parseTicketIroh(ticket.iroh);
+        const transport = options?.transport ?? "ws";
+        let dial: DialSpec;
+        let addr: string | undefined;
+        if (transport === "iroh") {
+          dial = await irohDial(irohInfo, ticket.node_id);
+        } else {
+          addr = addrOverride || ticket.addrs?.[0];
+          if (!addr) {
+            throw new Error(
+              "This ticket has no worker address — enter one (e.g. ws://192.168.1.42:9631).",
+            );
+          }
+          dial = { transport: "ws", url: addr, display: addr };
+        }
+
+        get()._client?.close();
+        set({ connectionStatus: "connecting", connectionError: null, activeTransport: transport });
+
+        let client: WorkerClient | null = null;
+        try {
+          client = await makeClient(dial);
+          await client.connect();
+          if (client.peerNodeId !== ticket.node_id) {
+            throw new Error(
+              `Worker at ${dial.display} identified itself as a different node than this ticket ` +
+                `claims (expected ${ticket.node_id}, got ${client.peerNodeId}) — check the ` +
+                "address, or get a fresh ticket from the worker you meant to pair with.",
+            );
+          }
+          await client.pairClaim(ticket.secret);
+          const mounts = await client.fsMounts();
+          const reattachableJob = await checkReattach(
+            client,
+            ticket.node_id,
+            latestActiveJobFor(ticket.node_id, get().trackedJobs),
+          );
+
+          const paired: PairedWorker = {
+            nodeId: ticket.node_id,
+            label: `Worker ${ticket.node_id.slice(0, 8)}`,
+            addrs: addr
+              ? [addr, ...(ticket.addrs ?? []).filter((a) => a !== addr)]
+              : [...(ticket.addrs ?? [])],
+            pairedAt: new Date().toISOString(),
+            iroh: irohInfo,
+            transport: rememberedTransport(transport),
+          };
+
+          set((state) => ({
+            pairedWorkers: upsertWorker(state.pairedWorkers, paired),
+            // A stale "unpaired" status from before this re-pair.
+            connections: Object.fromEntries(
+              Object.entries(state.connections).filter(([id]) => id !== paired.nodeId),
+            ),
+            workerErrors: { ...state.workerErrors, [paired.nodeId]: null },
+            selectedWorkerId: paired.nodeId,
+            connectionStatus: "connected",
+            connectionError: null,
+            workerMounts: mounts,
+            reattachableJob,
+            activeTransport: transport,
+            _client: client,
+          }));
+        } catch (err) {
+          // client.connect() may have already opened a real socket even
+          // though a later step (pairClaim/fsMounts) failed — close it so
+          // it isn't leaked, unreachable from store state but still live.
+          client?.close();
+          set({
+            connectionStatus: "error",
+            connectionError: err instanceof Error ? err.message : String(err),
+            _client: null,
+          });
+          throw err;
+        }
+
+        // Paired. Hand the worker to a managed connection (now via
+        // auth.prove, since this client is trusted) so a drop right after
+        // pairing — e.g. pair, start training, VPN blips — reconnects like
+        // any other. connectToWorker closes the pairing client. If this
+        // re-dial fails, the pairing itself still stands; connectToWorker
+        // has already put the error in connectionStatus/connectionError.
+        try {
+          await get().connectToWorker(ticket.node_id, { transport });
+        } catch {
+          // Surfaced via connectionError; the worker stays paired.
+        }
+      },
+
+      connectToWorker: async (nodeId, options) => {
+        const worker = get().pairedWorkers.find((w) => w.nodeId === nodeId);
+        if (!worker) {
+          throw new Error("Unknown worker — pair with it first.");
+        }
+
+        const previousSelected = get().selectedWorkerId;
+        if (previousSelected && previousSelected !== nodeId) {
+          // Switching the selected worker: back the old one off the same way
+          // an explicit disconnect() would (kept alive in the background if
+          // it still has an active job, otherwise fully stopped) — rather
+          // than just dropping its client, which would leave ITS managed
+          // connection's bookkeeping pointing at a client that's secretly
+          // already dead.
+          get().disconnect();
+        }
+
+        // An explicit connect to THIS worker always gets a fresh, verified
+        // connection: tear down any existing managed connection for it (its
+        // own retry loop, if it had one), and close any client left over
+        // from `pairWithTicket` (which doesn't itself register a managed
+        // connection — see its doc comment), which would otherwise leak
+        // here. Closing an already-closed client is a harmless no-op.
+        managed.get(nodeId)?.stop();
+        managed.delete(nodeId);
+        if (get().selectedWorkerId === nodeId) get()._client?.close();
+
+        set({
+          selectedWorkerId: nodeId,
+          connectionStatus: "connecting",
+          connectionError: null,
+        });
+
+        const mc = ensureConnection(nodeId, options);
+        let client: WorkerClient;
+        // Shared with `clientFor`, so a pane asking for this worker while we
+        // connect waits for this dial instead of failing "reconnecting".
+        const start = mc.start();
+        clientForStarts.set(nodeId, start);
+        try {
+          client = await start;
+        } catch (err) {
+          if (clientForStarts.get(nodeId) === start) clientForStarts.delete(nodeId);
+          // start() never adopted a client on failure — nothing to stop()
+          // (no `onClose` was ever wired) — just drop the dead instance so
+          // the next attempt builds a fresh one.
+          managed.delete(nodeId);
+          set({
+            connectionStatus: "error",
+            connectionError: err instanceof Error ? err.message : String(err),
+            _client: null,
+          });
+          throw err;
+        }
+        if (clientForStarts.get(nodeId) === start) clientForStarts.delete(nodeId);
+
+        try {
+          const mounts = await client.fsMounts();
+          const reattachableJob = await checkReattach(
+            client,
+            nodeId,
+            latestActiveJobFor(nodeId, get().trackedJobs),
+          );
+          // Remembered here (not in `ensureConnection`'s `onConnected`, which
+          // also fires for every automatic reconnect/fallback) so a route
+          // ManagedConnection falls back to on its own is never persisted as
+          // the user's preference — only an explicit choice (or the worker's
+          // own already-remembered one) is.
+          const transport = resolvePreferredTransport(worker, options);
+
+          set((state) => ({
+            pairedWorkers: state.pairedWorkers.map((w) =>
+              w.nodeId === nodeId ? { ...w, transport: rememberedTransport(transport) } : w,
+            ),
+            connectionStatus: "connected",
+            connectionError: null,
+            workerMounts: mounts,
+            reattachableJob,
+            activeTransport: mc.route,
+            _client: client,
+          }));
+        } catch (err) {
+          // See the matching comment in pairWithTicket — same leak risk:
+          // fsMounts/checkReattach failing after a successful dial still
+          // needs the client closed, so route it through the managed
+          // connection's own stop() rather than closing it directly (which
+          // would leave the ManagedConnection's bookkeeping pointing at a
+          // client that's actually already dead).
+          mc.stop();
+          managed.delete(nodeId);
+          set({
+            connectionStatus: "error",
+            connectionError: err instanceof Error ? err.message : String(err),
+            _client: null,
+          });
+          throw err;
+        }
+
+        // One-time import of this worker's legacy global path mappings
+        // (`~/.sleap-rtc/config.toml`, pre-dating per-worker `pathRules`) —
+        // only on a worker that's never had `pathRules` set at all (`[]`
+        // counts as "already handled", not "empty, try again"). Outside the
+        // try/catch above on purpose: `loadSavedMappings` already swallows
+        // its own errors (returns `[]`), so nothing here should ever turn a
+        // successful connect into a reported connection error.
+        if (worker.pathRules === undefined) {
+          const { loadSavedMappings } = await import("@/lib/pathMappings");
+          const pathRules = await loadSavedMappings();
+          set((state) => ({
+            pairedWorkers: state.pairedWorkers.map((w) =>
+              w.nodeId === nodeId ? { ...w, pathRules } : w,
+            ),
+          }));
+        }
+      },
+
+      selectWorker: async (nodeId, options) => {
+        if (nodeId === null) {
+          get().disconnect();
+          return;
+        }
+        await get().connectToWorker(nodeId, options);
+      },
+
+      disconnect: () => {
+        const { selectedWorkerId, trackedJobs } = get();
+        if (selectedWorkerId) {
+          if (activeJobsFor(selectedWorkerId, trackedJobs).length > 0) {
+            // Keep the managed connection running in the background — an
+            // active job still needs it — and only clear the selected-UI
+            // fields below. `selectedWorkerId` itself is left alone too
+            // (matches today: disconnect doesn't forget which worker was
+            // selected, just that it's no longer live).
+          } else {
+            managed.get(selectedWorkerId)?.stop();
+            managed.delete(selectedWorkerId);
+          }
+        }
+        set({
+          connectionStatus: "disconnected",
+          connectionError: null,
+          workerMounts: [],
+          reattachableJob: null,
+          activeTransport: null,
+          _client: null,
+        });
+      },
+
+      forgetWorker: async (nodeId) => {
+        // Always fully torn down, regardless of any active job — forgetting
+        // means the user doesn't want this worker tracked at all anymore,
+        // unlike a plain disconnect() (which keeps a background job alive).
+        const worker = get().pairedWorkers.find((w) => w.nodeId === nodeId);
+        const mc = managed.get(nodeId);
+        const liveClient = mc?.client?.authenticated
+          ? mc.client
+          : get().selectedWorkerId === nodeId && get()._client?.authenticated
+            ? get()._client
+            : null;
+        managed.delete(nodeId);
+        const wasSelected = get().selectedWorkerId === nodeId;
+        set((state) => {
+          const connections = Object.fromEntries(
+            Object.entries(state.connections).filter(([id]) => id !== nodeId),
+          );
+          return {
+            pairedWorkers: state.pairedWorkers.filter((w) => w.nodeId !== nodeId),
+            selectedWorkerId: wasSelected ? null : state.selectedWorkerId,
+            trackedJobs: state.trackedJobs.filter((j) => j.workerId !== nodeId),
+            connections,
+            ...(wasSelected
+              ? {
+                  connectionStatus: "disconnected" as ConnectionStatus,
+                  connectionError: null,
+                  workerMounts: [],
+                  reattachableJob: null,
+                  activeTransport: null,
+                  _client: null,
+                }
+              : {}),
+          };
+        });
+
+        // Then tell the worker, best effort: over the live connection if
+        // there is one, else a short dial. A worker that's offline (or
+        // already removed this device) just keeps or drops its entry on its
+        // own — `sleap-connect clients remove` there clears it.
+        try {
+          if (worker && !worker.unpairedAt) {
+            await withTimeout(leaveWorker(worker, liveClient), FORGET_LEAVE_TIMEOUT_MS);
+          }
+        } catch (err) {
+          console.warn("[connect] couldn't unpair from the worker on Forget:", err);
+        } finally {
+          mc?.stop();
+          if (liveClient && liveClient !== mc?.client) liveClient.close();
+        }
+      },
+
+      browseRemoteDir: async (path, offset, limit) => {
+        return fetchAllRemoteEntries(
+          (o) => {
+            const { _client } = get();
+            if (!_client || !_client.authenticated) {
+              throw new Error("Not connected to worker");
+            }
+            return _client.fsList(path, o);
+          },
+          offset,
+          limit,
+        );
+      },
+
+      browseRemoteDirOn: async (workerId, path, offset, limit) => {
+        const client = await get().clientFor(workerId);
+        return fetchAllRemoteEntries((o) => client.fsList(path, o), offset, limit);
+      },
+
+      mountsFor: async (workerId) => {
+        const client = await get().clientFor(workerId);
+        return client.fsMounts();
+      },
+
+      devicesFor: async (workerId) => {
+        const client = await get().clientFor(workerId);
+        return client.clientsList();
+      },
+
+      setDeviceName: async (name) => {
+        const clean = normalizeDeviceName(name);
+        if (!clean) return;
+        set({ deviceName: clean });
+        await pushDeviceNameToConnected(clean);
+      },
+
+      statWorkerPath: async (path) => {
+        const { _client } = get();
+        if (!_client || !_client.authenticated) {
+          throw new Error("Not connected to worker");
+        }
+        try {
+          const result = await _client.fsStat(path);
+          return { exists: true, type: result.type, shared: result.shared };
+        } catch (err) {
+          if (err instanceof WorkerProtocolError && err.code === FS_NOT_FOUND) {
+            return { exists: false };
+          }
+          if (err instanceof WorkerProtocolError && err.code === FS_FORBIDDEN) {
+            // An older worker refuses anything outside its shared folders.
+            return { exists: false, forbidden: true };
+          }
+          throw err;
+        }
+      },
+
+      addPathRule: (workerId, rule) => {
+        set((state) => ({
+          pairedWorkers: state.pairedWorkers.map((w) =>
+            w.nodeId === workerId
+              ? { ...w, pathRules: [...(w.pathRules ?? []).filter((r) => r.local !== rule.local), rule] }
+              : w,
+          ),
+        }));
+      },
+
+      setOutputDir: (workerId, projectKey, dir) => {
+        set((state) => ({
+          pairedWorkers: state.pairedWorkers.map((w) => {
+            if (w.nodeId !== workerId) return w;
+            const outputDirs = { ...(w.outputDirs ?? {}) };
+            if (dir) outputDirs[projectKey] = dir;
+            else delete outputDirs[projectKey];
+            return { ...w, outputDirs };
+          }),
+        }));
+      },
+
+      clearPathRule: (workerId, local) => {
+        set((state) => ({
+          pairedWorkers: state.pairedWorkers.map((w) =>
+            w.nodeId === workerId
+              ? { ...w, pathRules: (w.pathRules ?? []).filter((r) => r.local !== local) }
+              : w,
+          ),
+        }));
+      },
+
+      submitJob: async (spec, onProgress, options) => {
+        const { _client, selectedWorkerId } = get();
+        if (!_client || !_client.authenticated || !selectedWorkerId) {
+          throw new Error("Not connected to a worker");
+        }
+
+        // One id per call, links every job this submission produces — a
+        // single-job submission still gets one (index 0, count 1) so a job's
+        // `run` field is never a special case to check for; the Connect
+        // window (PR4b) only shows the "run i/n" tag once `count > 1`.
+        // `options.run` overrides this with an EXISTING run id (and tags
+        // `stage`) instead — see `SubmitJobOptions.run`'s doc.
+        const runId = options?.run?.id ?? crypto.randomUUID();
+        const runStage = options?.run?.stage;
+        const makeRun = (index: number, count: number): JobRun => ({
+          id: runId,
+          index,
+          count,
+          ...(runStage ? { stage: runStage } : {}),
+        });
+
+        if (isMultiModelTrainSpec(spec)) {
+          const modelTypes = spec.model_types ?? [];
+          const n = spec.config_contents.length;
+          let finalResult: JobResult = { jobId: "", success: true };
+          for (let i = 0; i < n; i++) {
+            const perModelSpec: TrainJobSpec = {
+              ...spec,
+              config_contents: [spec.config_contents[i]],
+              model_types: modelTypes[i] ? [modelTypes[i]] : [],
+              run: makeRun(i, n),
+            };
+            finalResult = await submitSingleJob(
+              _client,
+              selectedWorkerId,
+              perModelSpec,
+              onProgress,
+              set,
+              options?.onTelemetry && ((t) => options.onTelemetry!(t, i)),
+            );
+            if (!finalResult.success) return finalResult;
+            // Only intermediate models fire onModelComplete — matching the
+            // old JOB_COMPLETE-per-model semantics, the LAST model's
+            // completion is just the resolved return value.
+            if (i < n - 1) options?.onModelComplete?.(finalResult);
+          }
+          return finalResult;
+        }
+
+        return submitSingleJob(
+          _client,
+          selectedWorkerId,
+          { ...spec, run: makeRun(0, 1) },
+          onProgress,
+          set,
+          options?.onTelemetry && ((t) => options.onTelemetry!(t, 0)),
+        );
+      },
+
+      submitJobsOn: async (workerId, spec, opts) => {
+        const client = await get().clientFor(workerId);
+        const workerLabel =
+          get().pairedWorkers.find((w) => w.nodeId === workerId)?.label ?? workerId;
+        const runId = crypto.randomUUID();
+
+        const onChainedJobIds = (chainedIds: string[]) => {
+          for (const chainedId of chainedIds) {
+            trackChainedJob(set, client, workerId, chainedId, opts.source, workerLabel);
+          }
+        };
+
+        const submitTracked = async (oneSpec: JobSpec): Promise<string> => {
+          const { jobId } = await client.jobsSubmit(
+            withYamlRunName(oneSpec) as unknown as Record<string, unknown>,
+          );
+          const tracked: TrackedJob = {
+            workerId,
+            jobId,
+            lastSeq: 0,
+            kind: oneSpec.type,
+            label: trackedJobLabel(oneSpec),
+            source: opts.source,
+            state: "active",
+            seen: false,
+            submittedAt: Date.now(),
+          };
+          set((state) => ({ trackedJobs: capTrackedJobs([...state.trackedJobs, tracked]) }));
+          void watchTrackedJob(set, client, tracked, workerLabel, onChainedJobIds);
+          return jobId;
+        };
+
+        if (isMultiModelTrainSpec(spec)) {
+          const modelTypes = spec.model_types ?? [];
+          const n = spec.config_contents.length;
+          const jobIds: string[] = [];
+          // Every model's job is submitted up front — unlike `submitJob`,
+          // nothing here awaits a prior model finishing before queuing the
+          // next one (that's the whole point of a "fire and forget" submit).
+          for (let i = 0; i < n; i++) {
+            const perModelSpec: TrainJobSpec = {
+              ...spec,
+              config_contents: [spec.config_contents[i]],
+              model_types: modelTypes[i] ? [modelTypes[i]] : [],
+              run: { id: runId, index: i, count: n },
+            };
+            jobIds.push(await submitTracked(perModelSpec));
+          }
+          return jobIds;
+        }
+
+        return [await submitTracked({ ...spec, run: { id: runId, index: 0, count: 1 } })];
+      },
+
+      cancelJob: (runId) => {
+        void endCurrentRun("cancel", runId);
+        set({ reattachableJob: null });
+      },
+
+      stopJob: (runId) => {
+        void endCurrentRun("stop", runId);
+        set({ reattachableJob: null });
+      },
+
+      fetchResultBlob: async (ref) => {
+        const { _client, activeTransport } = get();
+        if (!_client || !_client.authenticated) {
+          throw new Error("Not connected to a worker");
+        }
+        if (activeTransport === "iroh") {
+          // Blob downloads dial the worker's HTTP blob port derived from a
+          // ws:// URL, which a direct iroh connection doesn't have (stage 2.4
+          // decides how blobs travel over iroh).
+          throw new Error(
+            `Result files can't be downloaded over an ${transportLabel("iroh")} connection this way yet — ` +
+              "reconnect over the worker's network address to fetch them.",
+          );
+        }
+        return _client.fetchBlob(ref.sha256, ref.size);
+      },
+
+      resumeTrackedJobs: async () => {
+        const jobsByWorker = new Map<string, TrackedJob[]>();
+        for (const job of get().trackedJobs) {
+          if (job.state !== "active") continue;
+          const list = jobsByWorker.get(job.workerId);
+          if (list) list.push(job);
+          else jobsByWorker.set(job.workerId, [job]);
+        }
+
+        for (const [workerId, jobs] of jobsByWorker) {
+          const worker = get().pairedWorkers.find((w) => w.nodeId === workerId);
+          if (!worker) continue; // forgotten since the job was tracked — nothing to resume
+          if (worker.unpairedAt) continue; // refused this device; re-pair to resume
+
+          let client: WorkerClient;
+          try {
+            client = await ensureConnection(workerId).start();
+          } catch (err) {
+            // No retry here: per ManagedConnection's own contract, a failed
+            // start() never starts a retry loop on its own. The jobs stay
+            // "active" — a later explicit connect, or the next launch's
+            // resumeTrackedJobs, tries again.
+            console.warn(`[connect] resumeTrackedJobs: couldn't reconnect to ${worker.label}:`, err);
+            managed.delete(workerId);
+            continue;
+          }
+
+          for (const job of jobs) {
+            let status: Awaited<ReturnType<WorkerClient["jobsStatus"]>>;
+            try {
+              status = await client.jobsStatus(job.jobId);
+            } catch {
+              continue; // worker no longer recognizes the job — leave as-is
+            }
+
+            if (TERMINAL_JOB_STATES.has(status.state)) {
+              const trackedState = status.state as TrackedJob["state"];
+              updateTrackedJob(set, job.jobId, {
+                state: trackedState,
+                ...(trackedState !== "completed" ? { error: status.error ?? undefined } : {}),
+              });
+              await notifyJobFinished({ ...job, state: trackedState }, worker.label, status.error);
+              // A train job that finished (and chained its post-train
+              // inference, PR5w) while this app was closed never replays its
+              // job.result event to a watcher — pick the chained jobs up from
+              // the stored result instead, so they're tracked and toast too.
+              const chainedIds = (status.result as { chained_job_ids?: unknown } | null)
+                ?.chained_job_ids;
+              if (Array.isArray(chainedIds)) {
+                for (const chainedId of chainedIds) {
+                  if (typeof chainedId !== "string") continue;
+                  trackChainedJob(set, client, workerId, chainedId, job.source, worker.label);
+                }
+              }
+              continue;
+            }
+
+            // A chained post-train inference job (PR5w) can complete while
+            // this app wasn't running to watch for it live — tracking it
+            // here too means it still shows up and still toasts, the same
+            // as one discovered mid-session via `submitJobsOn`.
+            await watchTrackedJob(set, client, job, worker.label, (chainedIds) => {
+              for (const chainedId of chainedIds) {
+                trackChainedJob(set, client, workerId, chainedId, job.source, worker.label);
+              }
+            });
+          }
+        }
+      },
+    }),
+    {
+      name: CONNECT_STORAGE_KEY,
+      version: CONNECT_PERSIST_VERSION,
+      storage: sharedConnectStorage,
+      partialize: sharedSlice,
+      merge: (persisted, current) => {
+        const shared = toShared(persisted);
+        if (!shared) return current;
+        const session = readSessionSelection();
+        const wanted = session !== undefined ? session : shared.lastSelectedWorkerId;
+        const paired = shared.pairedWorkers.some((w) => w.nodeId === wanted);
+        return { ...current, ...shared, selectedWorkerId: paired ? wanted : null };
+      },
+      migrate: migrateConnectPersisted as (persisted: unknown, version: number) => SharedConnectState,
+    },
+  ),
+);
+
+/**
+ * Applies a save made in ANOTHER tab/window (same origin = same identity,
+ * same shared Connect state). Every tab keeps its own in-memory store, so
+ * the stored copy is merged in (`mergeShared`, against the copy this tab
+ * last saw) rather than ignored — otherwise this tab would show a stale
+ * worker list and its next save would undo the other tab's changes. Takes
+ * the raw persisted value (`storage` event `newValue`); a no-op if it's
+ * unparseable or changes nothing here.
+ */
+export function syncConnectFromStorage(newValue: string | null): void {
+  const theirs = readStoredShared(newValue);
+  if (!theirs) return;
+  const mine = sharedSlice(useConnectStore.getState());
+  const merged = capShared(mergeShared(sharedBase, mine, theirs));
+  sharedBase = theirs;
+  if (!sameShared(merged, mine)) applyShared(merged);
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (e) => {
+    if (e.key === CONNECT_STORAGE_KEY) syncConnectFromStorage(e.newValue);
+  });
+  // Keep this window's selection across its own reloads, and offer it to the
+  // next window opened.
+  useConnectStore.subscribe((state, prev) => {
+    if (state.selectedWorkerId === prev.selectedWorkerId) return;
+    writeSessionSelection(state.selectedWorkerId);
+    if (state.selectedWorkerId && state.selectedWorkerId !== state.lastSelectedWorkerId) {
+      useConnectStore.setState({ lastSelectedWorkerId: state.selectedWorkerId });
+    }
+  });
+}

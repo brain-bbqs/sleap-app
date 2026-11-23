@@ -1,0 +1,2362 @@
+import { describe, it, expect, beforeEach } from "../bun-test";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import yaml from "js-yaml";
+import { Skeleton, Video, Labels, LabeledFrame, Instance, PredictedInstance, UserBoundingBox, PredictedBoundingBox } from "@talmolab/sleap-io.js";
+import { useTrainingStore } from "@/stores/trainingStore";
+import { getConfigSlots, getSlotLabel, defaultHyperparams, applyHyperparamsToYaml, mergeStdoutIntoLog, countUserLabeledFrames } from "@/stores/trainingStore";
+import type { ConfigFile } from "@/stores/trainingStore";
+
+/** Helper to create a ConfigFile with default hyperparams */
+function makeConfigFile(overrides: Partial<ConfigFile> = {}): ConfigFile {
+  return {
+    filename: "test.yaml",
+    content: "",
+    modelType: "centroid",
+    slot: "centroid",
+    hyperparams: { ...defaultHyperparams },
+    originalHyperparams: { ...defaultHyperparams },
+    hasTrainedModel: false,
+    checkpointPath: null,
+    ...overrides,
+  };
+}
+
+describe("trainingStore", () => {
+  beforeEach(() => {
+    useTrainingStore.getState().reset();
+  });
+
+  describe("initial state", () => {
+    it("starts idle with default config", () => {
+      const state = useTrainingStore.getState();
+      expect(state.status).toBe("idle");
+      expect(state.config.modelType).toBe("top_down");
+      expect(state.config.configs).toEqual([]);
+    });
+  });
+
+  describe("reset", () => {
+    it("bumps resetSeq every call, even back-to-back with no other state change", () => {
+      const before = useTrainingStore.getState().resetSeq;
+      useTrainingStore.getState().reset();
+      expect(useTrainingStore.getState().resetSeq).toBe(before + 1);
+      useTrainingStore.getState().reset();
+      expect(useTrainingStore.getState().resetSeq).toBe(before + 2);
+    });
+
+    it("bumps resetSeq even when modelType is unchanged (e.g. Train Again on Top-Down)", () => {
+      // TrainingPanel's baseline-autoload effect keys off [config.modelType,
+      // resetSeq] specifically because modelType alone doesn't change here.
+      expect(useTrainingStore.getState().config.modelType).toBe("top_down");
+      const before = useTrainingStore.getState().resetSeq;
+      useTrainingStore.getState().addConfigFile(makeConfigFile({ slot: "centroid" }));
+      useTrainingStore.getState().reset();
+      expect(useTrainingStore.getState().config.modelType).toBe("top_down");
+      expect(useTrainingStore.getState().config.configs).toEqual([]);
+      expect(useTrainingStore.getState().resetSeq).toBe(before + 1);
+    });
+  });
+
+  describe("setConfig", () => {
+    it("updates model type", () => {
+      useTrainingStore.getState().setConfig("modelType", "bottom_up");
+      expect(useTrainingStore.getState().config.modelType).toBe("bottom_up");
+    });
+
+    it("updates training labels path", () => {
+      useTrainingStore.getState().setConfig("trainingLabelsPath", "/data/labels.slp");
+      expect(useTrainingStore.getState().config.trainingLabelsPath).toBe("/data/labels.slp");
+    });
+  });
+
+  describe("addConfigFile / removeConfigFile", () => {
+    it("adds a config file to the correct slot", () => {
+      const file = makeConfigFile();
+      useTrainingStore.getState().addConfigFile(file);
+      expect(useTrainingStore.getState().config.configs).toHaveLength(1);
+      expect(useTrainingStore.getState().config.configs[0].slot).toBe("centroid");
+    });
+
+    it("replaces existing file in same slot", () => {
+      const file1 = makeConfigFile({ filename: "old.yaml" });
+      const file2 = makeConfigFile({ filename: "new.yaml" });
+      useTrainingStore.getState().addConfigFile(file1);
+      useTrainingStore.getState().addConfigFile(file2);
+      expect(useTrainingStore.getState().config.configs).toHaveLength(1);
+      expect(useTrainingStore.getState().config.configs[0].filename).toBe("new.yaml");
+    });
+
+    it("removes a config file by slot", () => {
+      useTrainingStore.getState().addConfigFile(makeConfigFile());
+      useTrainingStore.getState().removeConfigFile("centroid");
+      expect(useTrainingStore.getState().config.configs).toHaveLength(0);
+    });
+  });
+
+  describe("updateConfigHyperparams", () => {
+    it("updates hyperparams for a specific slot", () => {
+      useTrainingStore.getState().addConfigFile(makeConfigFile());
+      useTrainingStore.getState().updateConfigHyperparams("centroid", { maxEpochs: 500, batchSize: 16 });
+      const cf = useTrainingStore.getState().config.configs[0];
+      expect(cf.hyperparams.maxEpochs).toBe(500);
+      expect(cf.hyperparams.batchSize).toBe(16);
+      // unchanged fields stay default
+      expect(cf.hyperparams.learningRate).toBe(0.0001);
+    });
+
+    it("does not affect other slots", () => {
+      useTrainingStore.getState().addConfigFile(makeConfigFile({ slot: "centroid" }));
+      useTrainingStore.getState().addConfigFile(makeConfigFile({ slot: "centered_instance", modelType: "centered_instance" }));
+      useTrainingStore.getState().updateConfigHyperparams("centroid", { maxEpochs: 300 });
+      const configs = useTrainingStore.getState().config.configs;
+      expect(configs.find((c) => c.slot === "centroid")!.hyperparams.maxEpochs).toBe(300);
+      expect(configs.find((c) => c.slot === "centered_instance")!.hyperparams.maxEpochs).toBe(100);
+    });
+  });
+
+  describe("updateConfigCheckpointPath", () => {
+    it("sets checkpointPath for a specific slot", () => {
+      useTrainingStore.getState().addConfigFile(makeConfigFile());
+      useTrainingStore.getState().updateConfigCheckpointPath("centroid", "/proj/models/run1/best.ckpt");
+      const cf = useTrainingStore.getState().config.configs[0];
+      expect(cf.checkpointPath).toBe("/proj/models/run1/best.ckpt");
+    });
+
+    it("does not affect other slots", () => {
+      useTrainingStore.getState().addConfigFile(makeConfigFile({ slot: "centroid" }));
+      useTrainingStore.getState().addConfigFile(makeConfigFile({ slot: "centered_instance", modelType: "centered_instance" }));
+      useTrainingStore.getState().updateConfigCheckpointPath("centroid", "/proj/models/run1/best.ckpt");
+      const configs = useTrainingStore.getState().config.configs;
+      expect(configs.find((c) => c.slot === "centroid")!.checkpointPath).toBe("/proj/models/run1/best.ckpt");
+      expect(configs.find((c) => c.slot === "centered_instance")!.checkpointPath).toBeNull();
+    });
+
+    it("accepts null to clear a previously-set path", () => {
+      useTrainingStore.getState().addConfigFile(makeConfigFile({ checkpointPath: "/proj/models/run1/best.ckpt" }));
+      useTrainingStore.getState().updateConfigCheckpointPath("centroid", null);
+      expect(useTrainingStore.getState().config.configs[0].checkpointPath).toBeNull();
+    });
+  });
+
+  describe("parseYamlConfig", () => {
+    it("parses valid YAML and extracts model type + hyperparams", () => {
+      const yamlText = `
+model_config:
+  backbone_config:
+    unet:
+      filters: 32
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  max_epochs: 200
+  train_data_loader:
+    batch_size: 8
+  optimizer:
+    lr: 0.001
+  run_name: my_run
+  use_wandb: true
+  wandb:
+    entity: my-lab
+    project: my-project
+data_config:
+  train_labels_path: /path/to/labels.slp
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "centroid.yaml", "centroid");
+      expect(result).not.toBeNull();
+      expect(result!.modelType).toBe("centroid");
+      expect(result!.filename).toBe("centroid.yaml");
+      // Per-config hyperparams
+      expect(result!.hyperparams.maxEpochs).toBe(200);
+      expect(result!.hyperparams.batchSize).toBe(8);
+      expect(result!.hyperparams.learningRate).toBe(0.001);
+      // run_name is always blanked on import (see "always resets machine/run
+      // fields on import" below) even though this file has one — the file's
+      // run_name still drives `hasTrainedModel` detection separately.
+      expect(result!.hyperparams.runName).toBe("");
+      expect(result!.hyperparams.backbone).toBe("unet");
+      expect(result!.hyperparams.useWandb).toBe(true);
+      expect(result!.hyperparams.wandbEntity).toBe("my-lab");
+      expect(result!.hyperparams.wandbProject).toBe("my-project");
+      // Data path is NOT auto-filled from the uploaded config — it's specific
+      // to whatever machine/project the config came from and must always
+      // come from the currently loaded project instead (same rationale as
+      // the machine/run fields above).
+      expect(useTrainingStore.getState().config.trainingLabelsPath).toBe("");
+    });
+
+    it("returns null for invalid YAML", () => {
+      const result = useTrainingStore.getState().parseYamlConfig("not: [valid: yaml", "bad.yaml", "config");
+      expect(result).toBeNull();
+    });
+
+    it("handles config without wandb section", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centered_instance:
+      confmaps:
+        sigma: 2.5
+trainer_config:
+  max_epochs: 200
+  use_wandb: false
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "ci.yaml", "centered_instance");
+      expect(result).not.toBeNull();
+      expect(result!.hyperparams.useWandb).toBe(false);
+      expect(result!.hyperparams.wandbEntity).toBe("");
+      expect(result!.hyperparams.wandbProject).toBe("");
+    });
+
+    it("parses overfitMode from use_same_data_for_val", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  use_same_data_for_val: true
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result).not.toBeNull();
+      expect(result!.hyperparams.overfitMode).toBe(true);
+    });
+
+    it("detects hasTrainedModel from run_name", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  run_name: my_trained_model
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hasTrainedModel).toBe(true);
+    });
+
+    it("parses lr_scheduler.reduce_lr_on_plateau and reports its type + values", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  lr_scheduler:
+    step_lr: null
+    reduce_lr_on_plateau:
+      threshold: 2.0e-06
+      threshold_mode: rel
+      cooldown: 7
+      patience: 9
+      factor: 0.3
+      min_lr: 5.0e-09
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.lrSchedulerType).toBe("reduce_lr_on_plateau");
+      expect(result!.hyperparams.reduceLRThreshold).toBe(2e-6);
+      expect(result!.hyperparams.reduceLRThresholdMode).toBe("rel");
+      expect(result!.hyperparams.reduceLRCooldown).toBe(7);
+      expect(result!.hyperparams.reduceLRPatience).toBe(9);
+      expect(result!.hyperparams.reduceLRFactor).toBe(0.3);
+      expect(result!.hyperparams.reduceLRMinLR).toBe(5e-9);
+    });
+
+    it("parses lr_scheduler.cosine_annealing_warmup and reports its type + values", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  lr_scheduler:
+    cosine_annealing_warmup:
+      warmup_epochs: 6
+      warmup_start_lr: 0.00001
+      eta_min: 0.000002
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.lrSchedulerType).toBe("cosine_annealing_warmup");
+      expect(result!.hyperparams.cosineWarmupEpochs).toBe(6);
+      expect(result!.hyperparams.cosineWarmupStartLR).toBe(0.00001);
+      expect(result!.hyperparams.cosineEtaMin).toBe(0.000002);
+    });
+
+    it("reports lrSchedulerType 'none' when no scheduler sub-config is set", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  lr_scheduler:
+    step_lr: null
+    reduce_lr_on_plateau: null
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.lrSchedulerType).toBe("none");
+    });
+
+    it("parses model_ckpt.save_top_k/monitor/mode", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  model_ckpt:
+    save_top_k: 3
+    save_last: true
+    monitor: eval/val/moks
+    mode: max
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.saveBestModel).toBe(true);
+      expect(result!.hyperparams.saveTopKCount).toBe(3);
+      expect(result!.hyperparams.saveLastModel).toBe(true);
+      expect(result!.hyperparams.checkpointMonitor).toBe("eval/val/moks");
+      expect(result!.hyperparams.checkpointMode).toBe("max");
+    });
+
+    it("parses eval.oks_stddev/oks_scale/match_threshold", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  eval:
+    enabled: true
+    oks_stddev: 0.04
+    oks_scale: 1.5
+    match_threshold: 0.6
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.evalOksStddev).toBe(0.04);
+      expect(result!.hyperparams.evalOksScale).toBe(1.5);
+      expect(result!.hyperparams.evalMatchThreshold).toBe(0.6);
+    });
+
+    it("hasTrainedModel is false when no run_name", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hasTrainedModel).toBe(false);
+    });
+
+    it("does not auto-fill the global data path from an array-valued train_labels_path either", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  train_labels_path:
+    - /path/first.slp
+    - /path/second.slp
+`;
+      useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(useTrainingStore.getState().config.trainingLabelsPath).toBe("");
+    });
+
+    it("does not clobber an already-set data path when importing another config", () => {
+      useTrainingStore.getState().setConfig("trainingLabelsPath", "/current/project.slp");
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  train_labels_path: /some/other/machines/labels.slp
+  val_labels_path: /some/other/machines/val.slp
+`;
+      useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(useTrainingStore.getState().config.trainingLabelsPath).toBe("/current/project.slp");
+      expect(useTrainingStore.getState().config.validationLabelsPath).toBe("");
+    });
+  });
+
+  describe("reset", () => {
+    it("resets to initial state", () => {
+      useTrainingStore.getState().addConfigFile(
+        makeConfigFile({ hyperparams: { ...defaultHyperparams, maxEpochs: 999 } }),
+      );
+      useTrainingStore.getState().reset();
+      expect(useTrainingStore.getState().config.configs).toEqual([]);
+      expect(useTrainingStore.getState().status).toBe("idle");
+    });
+  });
+
+  describe("getConfigSlots", () => {
+    it("returns two slots for top_down", () => {
+      expect(getConfigSlots("top_down")).toEqual(["centroid", "centered_instance"]);
+    });
+
+    it("returns one slot for single_animal", () => {
+      expect(getConfigSlots("single_animal")).toEqual(["config"]);
+    });
+
+    it("returns one slot for bottom_up", () => {
+      expect(getConfigSlots("bottom_up")).toEqual(["config"]);
+    });
+  });
+
+  describe("getSlotLabel", () => {
+    it("returns correct labels", () => {
+      expect(getSlotLabel("centroid")).toBe("Centroid Config");
+      expect(getSlotLabel("centered_instance")).toBe("Centered Instance Config");
+      expect(getSlotLabel("config")).toBe("Config");
+    });
+  });
+
+  describe("applyHyperparamsToYaml", () => {
+    it("writes overfitMode to use_same_data_for_val", () => {
+      const input = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+      const hp = { ...defaultHyperparams, overfitMode: true };
+      const result = applyHyperparamsToYaml(input, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.data_config.use_same_data_for_val).toBe(true);
+    });
+  });
+
+  describe("applyHyperparamsToYaml - ZMQ is always enabled for GUI training", () => {
+    // sleap-nn's ZMQConfig has NO on/off boolean: controller_port and
+    // publish_port are Optional[int] = None, and a None port means the channel
+    // is never attached. Setting the ports IS enabling ZMQ. A GUI-launched run
+    // without them has no Stop Early and no live loss curve, so this gate
+    // forces them regardless of what the profile (or an imported config)
+    // carries.
+    const PROFILE_DIR = join(import.meta.dir, "../../src/assets/training_profiles");
+
+    /** The `trainer_config.zmq` block of a config, or undefined if it has none. */
+    function zmqOf(yamlText: string): Record<string, unknown> | undefined {
+      const doc = yaml.load(yamlText) as {
+        trainer_config?: { zmq?: Record<string, unknown> };
+      } | null;
+      return doc?.trainer_config?.zmq;
+    }
+
+    /** Run a raw config through the gate with stock hyperparams. */
+    const gate = (input: string) =>
+      applyHyperparamsToYaml(input, { ...defaultHyperparams });
+
+    it("materializes a zmq block when the config has none at all", () => {
+      // The dangerous case: `buildTrainingArgs` always appends
+      // `trainer_config.zmq.controller_port=...`, and Hydra refuses an override
+      // for a key missing from a struct config — an imported config with no
+      // `zmq:` key would abort training at parse time, not merely lose
+      // telemetry. The gate must create the block, not just fill it in.
+      expect(zmqOf(gate("trainer_config:\n  max_epochs: 5\n"))).toEqual({
+        controller_port: 9000,
+        publish_port: 9001,
+        controller_polling_timeout: 10,
+      });
+    });
+
+    it("replaces null ports left by an imported config", () => {
+      const input = [
+        "trainer_config:",
+        "  zmq:",
+        "    controller_port:",
+        "    publish_port:",
+        "    controller_polling_timeout: 10",
+        "",
+      ].join("\n");
+      const zmq = zmqOf(gate(input));
+      expect(zmq?.controller_port).toBe(9000);
+      expect(zmq?.publish_port).toBe(9001);
+    });
+
+    it("preserves a profile's own controller_polling_timeout", () => {
+      const input = [
+        "trainer_config:",
+        "  zmq:",
+        "    controller_port: 1",
+        "    publish_port: 2",
+        "    controller_polling_timeout: 250",
+        "",
+      ].join("\n");
+      const zmq = zmqOf(gate(input));
+      // Ports are forced to the app's; the timeout is the profile's business.
+      expect(zmq?.controller_port).toBe(9000);
+      expect(zmq?.publish_port).toBe(9001);
+      expect(zmq?.controller_polling_timeout).toBe(250);
+    });
+
+    it("uses the ports buildTrainingArgs overrides with (no YAML/CLI drift)", async () => {
+      const { buildTrainingArgs } = await import("@/platform/trainingArgs");
+      const args = buildTrainingArgs({
+        configFileName: "c.yaml",
+        configDir: "/tmp",
+        labelsPath: "/tmp/l.slp",
+        runName: "r",
+        ckptDir: "/tmp/m",
+      });
+      const zmq = zmqOf(gate("trainer_config: {}\n"));
+      expect(args).toContain(
+        `trainer_config.zmq.controller_port=${zmq?.controller_port}`,
+      );
+      expect(args).toContain(
+        `trainer_config.zmq.publish_port=${zmq?.publish_port}`,
+      );
+    });
+
+    it("every shipped baseline profile enables both ZMQ channels", () => {
+      // Guards the asset inconsistency this test was written for: the two
+      // multi_class profiles shipped with NULL ports while the other eight
+      // hardcoded 9000/9001, so running them outside the app got no progress
+      // and no stop channel.
+      const profiles = readdirSync(PROFILE_DIR).filter((f) => f.endsWith(".yaml"));
+      expect(profiles.length).toBeGreaterThan(0);
+      for (const name of profiles) {
+        const zmq = zmqOf(readFileSync(join(PROFILE_DIR, name), "utf8"));
+        expect(zmq, `${name} has no trainer_config.zmq block`).toBeDefined();
+        expect(zmq?.controller_port, `${name} controller_port`).toBe(9000);
+        expect(zmq?.publish_port, `${name} publish_port`).toBe(9001);
+      }
+    });
+  });
+
+  describe("applyHyperparamsToYaml - lr_scheduler", () => {
+    const baseYaml = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+
+    it("writes only reduce_lr_on_plateau when selected, nulling the other three", () => {
+      const hp = {
+        ...defaultHyperparams,
+        lrSchedulerType: "reduce_lr_on_plateau" as const,
+        reduceLRThreshold: 1e-5,
+        reduceLRThresholdMode: "rel" as const,
+        reduceLRCooldown: 2,
+        reduceLRPatience: 4,
+        reduceLRFactor: 0.25,
+        reduceLRMinLR: 1e-7,
+      };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.lr_scheduler.reduce_lr_on_plateau).toEqual({
+        threshold: 1e-5,
+        threshold_mode: "rel",
+        cooldown: 2,
+        patience: 4,
+        factor: 0.25,
+        min_lr: 1e-7,
+      });
+      expect(doc.trainer_config.lr_scheduler.step_lr).toBeNull();
+      expect(doc.trainer_config.lr_scheduler.cosine_annealing_warmup).toBeNull();
+      expect(doc.trainer_config.lr_scheduler.linear_warmup_linear_decay).toBeNull();
+    });
+
+    it("writes only step_lr when selected", () => {
+      const hp = { ...defaultHyperparams, lrSchedulerType: "step_lr" as const, stepLRStepSize: 20, stepLRGamma: 0.2 };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.lr_scheduler.step_lr).toEqual({ step_size: 20, gamma: 0.2 });
+      expect(doc.trainer_config.lr_scheduler.reduce_lr_on_plateau).toBeNull();
+    });
+
+    it("writes only cosine_annealing_warmup when selected", () => {
+      const hp = {
+        ...defaultHyperparams,
+        lrSchedulerType: "cosine_annealing_warmup" as const,
+        cosineWarmupEpochs: 8,
+        cosineWarmupStartLR: 0.00001,
+        cosineEtaMin: 0.000001,
+      };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.lr_scheduler.cosine_annealing_warmup).toEqual({
+        warmup_epochs: 8,
+        warmup_start_lr: 0.00001,
+        eta_min: 0.000001,
+      });
+      expect(doc.trainer_config.lr_scheduler.step_lr).toBeNull();
+      expect(doc.trainer_config.lr_scheduler.reduce_lr_on_plateau).toBeNull();
+    });
+
+    it("writes only linear_warmup_linear_decay when selected", () => {
+      const hp = {
+        ...defaultHyperparams,
+        lrSchedulerType: "linear_warmup_linear_decay" as const,
+        linearWarmupEpochs: 3,
+        linearWarmupStartLR: 0.00002,
+        linearEndLR: 0.0000001,
+      };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.lr_scheduler.linear_warmup_linear_decay).toEqual({
+        warmup_epochs: 3,
+        warmup_start_lr: 0.00002,
+        end_lr: 0.0000001,
+      });
+      expect(doc.trainer_config.lr_scheduler.cosine_annealing_warmup).toBeNull();
+    });
+
+    it("nulls all four sub-schedulers when type is 'none'", () => {
+      const hp = { ...defaultHyperparams, lrSchedulerType: "none" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.lr_scheduler.step_lr).toBeNull();
+      expect(doc.trainer_config.lr_scheduler.reduce_lr_on_plateau).toBeNull();
+      expect(doc.trainer_config.lr_scheduler.cosine_annealing_warmup).toBeNull();
+      expect(doc.trainer_config.lr_scheduler.linear_warmup_linear_decay).toBeNull();
+    });
+  });
+
+  describe("applyHyperparamsToYaml - checkpoint retention", () => {
+    const baseYaml = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+
+    it("writes save_top_k as the configured count when saveBestModel is on", () => {
+      const hp = { ...defaultHyperparams, saveBestModel: true, saveTopKCount: 3, checkpointMonitor: "eval/val/moks", checkpointMode: "max" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.model_ckpt.save_top_k).toBe(3);
+      expect(doc.trainer_config.model_ckpt.monitor).toBe("eval/val/moks");
+      expect(doc.trainer_config.model_ckpt.mode).toBe("max");
+    });
+
+    it("writes save_top_k as 0 when saveBestModel is off, regardless of saveTopKCount", () => {
+      const hp = { ...defaultHyperparams, saveBestModel: false, saveTopKCount: 5 };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.model_ckpt.save_top_k).toBe(0);
+    });
+
+    it("supports -1 (keep all) as a valid save_top_k count", () => {
+      const hp = { ...defaultHyperparams, saveBestModel: true, saveTopKCount: -1 };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.model_ckpt.save_top_k).toBe(-1);
+    });
+  });
+
+  describe("applyHyperparamsToYaml - epoch-end eval extras", () => {
+    it("writes oks_stddev, oks_scale, and match_threshold", () => {
+      const input = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+      const hp = { ...defaultHyperparams, evalEnabled: true, evalOksStddev: 0.05, evalOksScale: 1.2, evalMatchThreshold: 0.5 };
+      const doc = yaml.load(applyHyperparamsToYaml(input, hp)) as Record<string, any>;
+      expect(doc.trainer_config.eval.oks_stddev).toBe(0.05);
+      expect(doc.trainer_config.eval.oks_scale).toBe(1.2);
+      expect(doc.trainer_config.eval.match_threshold).toBe(0.5);
+    });
+  });
+
+  describe("applyHyperparamsToYaml - resume / fine-tune", () => {
+    const baseYaml = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+    const ckptPath = "/proj/models/prev_run/last.ckpt";
+
+    it("sets trainer_config.resume_ckpt_path when trainingMode is 'resume' and a checkpoint is given", () => {
+      const hp = { ...defaultHyperparams, trainingMode: "resume" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp, ckptPath)) as Record<string, any>;
+      expect(doc.trainer_config.resume_ckpt_path).toBe(ckptPath);
+      expect(doc.model_config.pretrained_backbone_weights).toBeNull();
+      expect(doc.model_config.pretrained_head_weights).toBeNull();
+    });
+
+    it("sets model_config.pretrained_*_weights when trainingMode is 'finetune' and a checkpoint is given", () => {
+      const hp = { ...defaultHyperparams, trainingMode: "finetune" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp, ckptPath)) as Record<string, any>;
+      expect(doc.model_config.pretrained_backbone_weights).toBe(ckptPath);
+      expect(doc.model_config.pretrained_head_weights).toBe(ckptPath);
+      expect(doc.trainer_config.resume_ckpt_path).toBeNull();
+    });
+
+    it("clears both resume/fine-tune fields when trainingMode is 'reuse_config' (train from scratch)", () => {
+      const hp = { ...defaultHyperparams, trainingMode: "reuse_config" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp, ckptPath)) as Record<string, any>;
+      expect(doc.trainer_config.resume_ckpt_path).toBeNull();
+      expect(doc.model_config.pretrained_backbone_weights).toBeNull();
+      expect(doc.model_config.pretrained_head_weights).toBeNull();
+    });
+
+    it("REGRESSION: clears a stale resume_ckpt_path baked into an auto-loaded config when mode is switched to fine-tune", () => {
+      const staleYaml = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  resume_ckpt_path: /proj/models/some_older_run/last.ckpt
+`;
+      const hp = { ...defaultHyperparams, trainingMode: "finetune" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(staleYaml, hp, ckptPath)) as Record<string, any>;
+      expect(doc.trainer_config.resume_ckpt_path).toBeNull();
+      expect(doc.model_config.pretrained_backbone_weights).toBe(ckptPath);
+    });
+
+    it("does not set resume_ckpt_path for 'resume' mode when no checkpoint path is available", () => {
+      const hp = { ...defaultHyperparams, trainingMode: "resume" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp, null)) as Record<string, any>;
+      expect(doc.trainer_config.resume_ckpt_path).toBeNull();
+    });
+  });
+
+  describe("parseYamlConfig - checkpointPath", () => {
+    it("threads a passed checkpointPath onto the returned ConfigFile", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid: {}
+trainer_config:
+  run_name: "250101_120000.centroid.n=10"
+`;
+      const result = useTrainingStore
+        .getState()
+        .parseYamlConfig(yamlText, "training_config.yaml", "centroid", "/proj/models/run1/last.ckpt");
+      expect(result?.checkpointPath).toBe("/proj/models/run1/last.ckpt");
+    });
+
+    it("defaults checkpointPath to null when not passed", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid: {}
+trainer_config: {}
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result?.checkpointPath).toBeNull();
+    });
+  });
+
+  describe("applyHyperparamsToYaml - augmentation", () => {
+    const baseYaml = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+
+    it("writes rotation ±180° correctly", () => {
+      const hp = { ...defaultHyperparams, rotationPreset: "180" as const };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const aug = doc.data_config.augmentation_config;
+      expect(aug.geometric.rotation_min).toBe(-180);
+      expect(aug.geometric.rotation_max).toBe(180);
+      expect(aug.geometric.affine_p).toBe(1.0);
+    });
+
+    it("writes rotation off correctly", () => {
+      const hp = { ...defaultHyperparams, rotationPreset: "off" as const };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const aug = doc.data_config.augmentation_config;
+      expect(aug.geometric.affine_p).toBe(0);
+    });
+
+    it("writes rotation ±15° correctly", () => {
+      const hp = { ...defaultHyperparams, rotationPreset: "15" as const };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const geo = doc.data_config.augmentation_config.geometric;
+      expect(geo.rotation_min).toBe(-15);
+      expect(geo.rotation_max).toBe(15);
+      expect(geo.affine_p).toBe(1.0);
+    });
+
+    it("writes custom rotation angle correctly", () => {
+      const hp = { ...defaultHyperparams, rotationPreset: "custom" as const, rotationCustomAngle: 30 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const geo = doc.data_config.augmentation_config.geometric;
+      expect(geo.rotation_min).toBe(-30);
+      expect(geo.rotation_max).toBe(30);
+      expect(geo.affine_p).toBe(1.0);
+    });
+
+    it("writes scale when enabled", () => {
+      const hp = { ...defaultHyperparams, scaleEnabled: true, scaleMin: 0.8, scaleMax: 1.2 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const geo = doc.data_config.augmentation_config.geometric;
+      expect(geo.scale_min).toBe(0.8);
+      expect(geo.scale_max).toBe(1.2);
+    });
+
+    it("resets scale_min/max to 1.0 when scale disabled", () => {
+      const hp = { ...defaultHyperparams, scaleEnabled: false };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const geo = doc.data_config.augmentation_config.geometric;
+      expect(geo.scale_min).toBe(1.0);
+      expect(geo.scale_max).toBe(1.0);
+    });
+
+    it("writes gaussian noise when enabled", () => {
+      const hp = { ...defaultHyperparams, gaussianNoiseEnabled: true, gaussianNoiseMean: 0.0, gaussianNoiseStd: 0.04 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const int = doc.data_config.augmentation_config.intensity;
+      expect(int.gaussian_noise_p).toBe(1.0);
+      expect(int.gaussian_noise_mean).toBe(0.0);
+      expect(int.gaussian_noise_std).toBe(0.04);
+    });
+
+    it("sets gaussian_noise_p to 0 when disabled", () => {
+      const hp = { ...defaultHyperparams, gaussianNoiseEnabled: false };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const int = doc.data_config.augmentation_config.intensity;
+      expect(int.gaussian_noise_p).toBe(0);
+    });
+
+    it("writes uniform noise when enabled", () => {
+      const hp = { ...defaultHyperparams, uniformNoiseEnabled: true, uniformNoiseMin: 0.0, uniformNoiseMax: 0.1 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const int = doc.data_config.augmentation_config.intensity;
+      expect(int.uniform_noise_p).toBe(1.0);
+      expect(int.uniform_noise_min).toBe(0.0);
+      expect(int.uniform_noise_max).toBe(0.1);
+    });
+
+    it("writes contrast when enabled", () => {
+      const hp = { ...defaultHyperparams, contrastEnabled: true, contrastMin: 0.5, contrastMax: 2.0 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const int = doc.data_config.augmentation_config.intensity;
+      expect(int.contrast_p).toBe(1.0);
+      expect(int.contrast_min).toBe(0.5);
+      expect(int.contrast_max).toBe(2.0);
+    });
+
+    it("writes brightness when enabled", () => {
+      const hp = { ...defaultHyperparams, brightnessEnabled: true, brightnessMin: 0.0, brightnessMax: 0.2 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const int = doc.data_config.augmentation_config.intensity;
+      expect(int.brightness_p).toBe(1.0);
+      expect(int.brightness_min).toBe(0.0);
+      expect(int.brightness_max).toBe(0.2);
+    });
+  });
+
+  describe("applyHyperparamsToYaml - model params", () => {
+    const baseYaml = `
+data_config: {}
+model_config:
+  backbone_config:
+    unet:
+      filters: 16
+      max_stride: 16
+  head_configs:
+    centroid:
+      confmaps:
+        sigma: 2.5
+        output_stride: 2
+trainer_config: {}
+`;
+
+    it("writes backbone model params to YAML", () => {
+      const hp = { ...defaultHyperparams, maxStride: 32, filters: 24, filtersRate: 1.5, middleBlock: false, upInterpolate: false };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const unet = doc.model_config.backbone_config.unet;
+      expect(unet.max_stride).toBe(32);
+      expect(unet.filters).toBe(24);
+      expect(unet.filters_rate).toBe(1.5);
+      expect(unet.middle_block).toBe(false);
+      expect(unet.up_interpolate).toBe(false);
+    });
+
+    it("writes output_stride to head config", () => {
+      const hp = { ...defaultHyperparams, outputStride: 4 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.model_config.head_configs.centroid.confmaps.output_stride).toBe(4);
+    });
+
+    it("writes stem_stride to backbone config", () => {
+      const hp = { ...defaultHyperparams, stemStride: 2 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.model_config.backbone_config.unet.stem_stride).toBe(2);
+    });
+
+    it("writes anchor_part to head config", () => {
+      const hp = { ...defaultHyperparams, anchorPart: "thorax" };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.model_config.head_configs.centroid.confmaps.anchor_part).toBe("thorax");
+    });
+
+    // max_stride has no server-side Auto resolution (unlike crop_size, which
+    // intentionally rides through as `null` for sleap-nn to resolve at real
+    // training time) — a null hp.maxStride must always be resolved to a
+    // concrete int before this function's output leaves the app.
+    it("resolves a null (Auto) maxStride to the legacy default when no resolvedMaxStride is supplied", () => {
+      const hp = { ...defaultHyperparams, maxStride: null };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.model_config.backbone_config.unet.max_stride).toBe(16);
+    });
+
+    it("resolves a null (Auto) maxStride using the caller-supplied resolvedMaxStride", () => {
+      const hp = { ...defaultHyperparams, maxStride: null };
+      const result = applyHyperparamsToYaml(baseYaml, hp, null, 64);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.model_config.backbone_config.unet.max_stride).toBe(64);
+    });
+
+    it("prefers an explicit maxStride over a caller-supplied resolvedMaxStride", () => {
+      const hp = { ...defaultHyperparams, maxStride: 32 };
+      const result = applyHyperparamsToYaml(baseYaml, hp, null, 64);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.model_config.backbone_config.unet.max_stride).toBe(32);
+    });
+
+    // in_channels has no server-side Auto resolution either — a caller must
+    // resolve colorMode against the project's actual video channel count
+    // (see resolveInputChannels in modelStats.ts) before this function's
+    // output leaves the app.
+    it("defaults in_channels to 1 (grayscale) when no resolvedInChannels is supplied", () => {
+      const result = applyHyperparamsToYaml(baseYaml, defaultHyperparams);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.model_config.backbone_config.unet.in_channels).toBe(1);
+    });
+
+    it("applies the caller-supplied resolvedInChannels (e.g. a 3-channel video under Auto colorMode)", () => {
+      const result = applyHyperparamsToYaml(baseYaml, defaultHyperparams, null, undefined, 3);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.model_config.backbone_config.unet.in_channels).toBe(3);
+    });
+  });
+
+  // Baseline profiles ship `unet: {...}, convnext: null, swint: null`; sleap-nn
+  // builds whichever key is non-null, so picking ConvNeXt/SwinT must swap
+  // which block is populated — otherwise the run silently trains a UNet.
+  describe("applyHyperparamsToYaml - ConvNeXt / SwinT backbones", () => {
+    const profileYaml = readFileSync(
+      join(import.meta.dir, "../../src/assets/training_profiles/baseline_medium_rf.bottomup.yaml"),
+      "utf-8",
+    );
+    type Block = Record<string, unknown>;
+    type BackboneConfig = Record<"unet" | "convnext" | "swint", Block>;
+    const backboneOf = (text: string) =>
+      (yaml.load(text) as { model_config: { backbone_config: BackboneConfig } }).model_config.backbone_config;
+    const apply = (hp: Partial<typeof defaultHyperparams>, inCh?: number) =>
+      backboneOf(applyHyperparamsToYaml(profileYaml, { ...defaultHyperparams, ...hp }, null, undefined, inCh));
+
+    it("writes a convnext block and nulls unet/swint", () => {
+      const bc = apply({ backbone: "convnext" });
+      expect(bc.unet).toBeNull();
+      expect(bc.swint).toBeNull();
+      expect(bc.convnext.model_type).toBe("tiny");
+      expect(bc.convnext.pre_trained_weights).toBe("ConvNeXt_Tiny_Weights");
+      expect(bc.convnext.in_channels).toBe(3);
+      expect(bc.convnext.max_stride).toBe(32);
+    });
+
+    it("maps each size to its torchvision weight name", () => {
+      expect(apply({ backbone: "convnext", backboneSize: "large" }).convnext.pre_trained_weights).toBe("ConvNeXt_Large_Weights");
+      expect(apply({ backbone: "swint", backboneSize: "small" }).swint.pre_trained_weights).toBe("Swin_S_Weights");
+      expect(apply({ backbone: "swint", backboneSize: "base" }).swint.pre_trained_weights).toBe("Swin_B_Weights");
+    });
+
+    it("clamps SwinT to tiny when 'large' (ConvNeXt-only) is carried over", () => {
+      const bc = apply({ backbone: "swint", backboneSize: "large" });
+      expect(bc.swint.model_type).toBe("tiny");
+      expect(bc.swint.pre_trained_weights).toBe("Swin_T_Weights");
+    });
+
+    it("writes null pre_trained_weights and the resolved channels when training from scratch", () => {
+      const bc = apply({ backbone: "convnext", pretrainedWeights: false }, 1);
+      expect(bc.convnext.pre_trained_weights).toBeNull();
+      expect(bc.convnext.in_channels).toBe(1);
+    });
+
+    it("sets the backbone output_stride to the smallest head stride, not sleap-nn's default of 1", () => {
+      // bottom-up profile: confmaps at hp.outputStride, pafs at 8
+      expect(apply({ backbone: "swint", outputStride: 4 }).swint.output_stride).toBe(4);
+    });
+
+    it("restores a complete unet block when switching back from convnext", () => {
+      const convnextYaml = applyHyperparamsToYaml(profileYaml, { ...defaultHyperparams, backbone: "convnext" });
+      const bc = backboneOf(applyHyperparamsToYaml(convnextYaml, { ...defaultHyperparams, backbone: "unet" }));
+      expect(bc.convnext).toBeNull();
+      expect(bc.unet.kernel_size).toBe(3);
+      expect(bc.unet.convs_per_block).toBe(2);
+      expect(bc.unet.output_stride).toBe(2);
+    });
+
+    it("round-trips size and pretrained choice through parseYamlConfig", () => {
+      for (const [backbone, backboneSize, pretrainedWeights] of [
+        ["convnext", "base", true],
+        ["swint", "small", false],
+      ] as const) {
+        const text = applyHyperparamsToYaml(profileYaml, { ...defaultHyperparams, backbone, backboneSize, pretrainedWeights });
+        const parsed = useTrainingStore.getState().parseYamlConfig(text, "x.yaml", "bottomup")!.hyperparams;
+        expect(parsed.backbone).toBe(backbone);
+        expect(parsed.backboneSize).toBe(backboneSize);
+        expect(parsed.pretrainedWeights).toBe(pretrainedWeights);
+      }
+    });
+  });
+
+  describe("parseYamlConfig - model params", () => {
+    it("extracts backbone params from YAML", () => {
+      const yamlText = `
+model_config:
+  backbone_config:
+    unet:
+      filters: 24
+      filters_rate: 1.5
+      max_stride: 32
+      stem_stride: 2
+      middle_block: false
+      up_interpolate: false
+  head_configs:
+    centered_instance:
+      confmaps:
+        output_stride: 4
+        anchor_part: thorax
+        sigma: 2.5
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "ci.yaml", "centered_instance");
+      expect(result!.hyperparams.filters).toBe(24);
+      expect(result!.hyperparams.filtersRate).toBe(1.5);
+      expect(result!.hyperparams.maxStride).toBe(32);
+      expect(result!.hyperparams.stemStride).toBe(2);
+      expect(result!.hyperparams.middleBlock).toBe(false);
+      expect(result!.hyperparams.upInterpolate).toBe(false);
+      expect(result!.hyperparams.outputStride).toBe(4);
+      expect(result!.hyperparams.anchorPart).toBe("thorax");
+    });
+  });
+
+  describe("applyHyperparamsToYaml - data and optimization", () => {
+    const baseYaml = `
+data_config:
+  preprocessing: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  early_stopping: {}
+  online_hard_keypoint_mining: {}
+`;
+
+    it("writes cropSize to preprocessing", () => {
+      const hp = { ...defaultHyperparams, cropSize: 192 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.data_config.preprocessing.crop_size).toBe(192);
+    });
+
+    it("writes null cropSize as null", () => {
+      const hp = { ...defaultHyperparams, cropSize: null };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.data_config.preprocessing.crop_size).toBeNull();
+    });
+
+    it("writes randomSeed to trainer_config.seed", () => {
+      const hp = { ...defaultHyperparams, randomSeed: 42 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.trainer_config.seed).toBe(42);
+    });
+
+    it("writes stop_training_on_plateau", () => {
+      const hp = { ...defaultHyperparams, stopOnPlateau: false };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.trainer_config.early_stopping.stop_training_on_plateau).toBe(false);
+    });
+
+    it("writes plateauMinDelta to early_stopping.min_delta", () => {
+      const hp = { ...defaultHyperparams, plateauMinDelta: 0.001 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      expect(doc.trainer_config.early_stopping.min_delta).toBe(0.001);
+    });
+
+    it("writes online mining params", () => {
+      const hp = { ...defaultHyperparams, onlineMining: true, minHardKeypoints: 3, maxHardKeypoints: 10 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const ohkm = doc.trainer_config.online_hard_keypoint_mining;
+      expect(ohkm.online_mining).toBe(true);
+      expect(ohkm.min_hard_keypoints).toBe(3);
+      expect(ohkm.max_hard_keypoints).toBe(10);
+    });
+
+    it("writes hardToEasyRatio and lossScale to online_hard_keypoint_mining", () => {
+      const hp = { ...defaultHyperparams, hardToEasyRatio: 3.5, lossScale: 7.0 };
+      const result = applyHyperparamsToYaml(baseYaml, hp);
+      const doc = yaml.load(result) as Record<string, any>;
+      const ohkm = doc.trainer_config.online_hard_keypoint_mining;
+      expect(ohkm.hard_to_easy_ratio).toBe(3.5);
+      expect(ohkm.loss_scale).toBe(7.0);
+    });
+
+    it("overrides the shipped baseline profile's OHKM defaults (real config round-trip)", () => {
+      // Read the ACTUAL profile the app ships (and sleap-nn reads via --config-name),
+      // not a synthetic stub, to prove the user's values replace what ships.
+      const baselinePath = join(
+        import.meta.dir,
+        "../../src/assets/training_profiles/baseline_medium_rf.topdown.yaml"
+      );
+      const baselineYaml = readFileSync(baselinePath, "utf8");
+
+      // Sanity: the shipped profile carries the sleap-nn defaults we intend to override.
+      const before = yaml.load(baselineYaml) as Record<string, any>;
+      expect(before.trainer_config.online_hard_keypoint_mining.hard_to_easy_ratio).toBe(2.0);
+      expect(before.trainer_config.online_hard_keypoint_mining.loss_scale).toBe(5.0);
+
+      const hp = { ...defaultHyperparams, hardToEasyRatio: 3.5, lossScale: 7.0 };
+      const doc = yaml.load(applyHyperparamsToYaml(baselineYaml, hp)) as Record<string, any>;
+      const ohkm = doc.trainer_config.online_hard_keypoint_mining;
+      expect(ohkm.hard_to_easy_ratio).toBe(3.5);
+      expect(ohkm.loss_scale).toBe(7.0);
+    });
+  });
+
+  describe("applyHyperparamsToYaml - performance", () => {
+    const baseYaml = `
+data_config:
+  preprocessing: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  train_data_loader: {}
+  val_data_loader: {}
+`;
+
+    it("maps dataPipeline 'memory' → data_pipeline_fw torch_dataset_cache_img_memory", () => {
+      const hp = { ...defaultHyperparams, dataPipeline: "memory" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.data_config.data_pipeline_fw).toBe("torch_dataset_cache_img_memory");
+    });
+
+    it("maps dataPipeline 'disk' → data_pipeline_fw torch_dataset_cache_img_disk", () => {
+      const hp = { ...defaultHyperparams, dataPipeline: "disk" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.data_config.data_pipeline_fw).toBe("torch_dataset_cache_img_disk");
+    });
+
+    it("maps dataPipeline 'stream' → data_pipeline_fw torch_dataset", () => {
+      const hp = { ...defaultHyperparams, dataPipeline: "stream" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.data_config.data_pipeline_fw).toBe("torch_dataset");
+    });
+
+    it("writes dataloaderWorkers to both train and val loaders (caching pipeline)", () => {
+      const hp = { ...defaultHyperparams, dataPipeline: "memory" as const, dataloaderWorkers: 4 };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.train_data_loader.num_workers).toBe(4);
+      expect(doc.trainer_config.val_data_loader.num_workers).toBe(4);
+    });
+
+    it("clamps num_workers to 0 when pipeline is 'stream' (torch_dataset)", () => {
+      const hp = { ...defaultHyperparams, dataPipeline: "stream" as const, dataloaderWorkers: 8 };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.train_data_loader.num_workers).toBe(0);
+      expect(doc.trainer_config.val_data_loader.num_workers).toBe(0);
+    });
+
+    it("writes numDevices 'auto' to trainer_devices", () => {
+      const hp = { ...defaultHyperparams, numDevices: "auto" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.trainer_devices).toBe("auto");
+    });
+
+    it("writes numeric numDevices to trainer_devices", () => {
+      const hp = { ...defaultHyperparams, numDevices: 2 };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.trainer_devices).toBe(2);
+    });
+
+    it("writes trainerStrategy to trainer_strategy", () => {
+      const hp = { ...defaultHyperparams, trainerStrategy: "ddp" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.trainer_strategy).toBe("ddp");
+    });
+
+    it("writes the default trainerStrategy ('auto') to trainer_strategy", () => {
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, defaultHyperparams)) as Record<string, any>;
+      expect(doc.trainer_config.trainer_strategy).toBe("auto");
+    });
+  });
+
+  describe("parseYamlConfig - performance", () => {
+    it("always resets dataPipeline, dataloaderWorkers, and numDevices to defaults, regardless of the file", () => {
+      // Performance/machine-specific settings — never taken from an uploaded
+      // config (see the "always resets machine/run fields on import" describe
+      // block). dataPipeline joined this group after a user report that a
+      // config's stale data_pipeline_fw was still being read into the field.
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  data_pipeline_fw: torch_dataset_cache_img_memory
+trainer_config:
+  train_data_loader:
+    num_workers: 4
+  trainer_devices: 2
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.dataPipeline).toBe(defaultHyperparams.dataPipeline);
+      expect(result!.hyperparams.dataloaderWorkers).toBe(defaultHyperparams.dataloaderWorkers);
+      expect(result!.hyperparams.numDevices).toBe(defaultHyperparams.numDevices);
+    });
+
+    it("round-trips through parse → apply using the app's defaults, not the file's stale values", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  data_pipeline_fw: torch_dataset_cache_img_disk
+trainer_config:
+  train_data_loader:
+    num_workers: 3
+  val_data_loader:
+    num_workers: 3
+  trainer_devices: 4
+`;
+      const parsed = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, parsed!.hyperparams)) as Record<string, any>;
+      const expectedFw = { stream: "torch_dataset", memory: "torch_dataset_cache_img_memory", disk: "torch_dataset_cache_img_disk" }[defaultHyperparams.dataPipeline];
+      expect(doc.data_config.data_pipeline_fw).toBe(expectedFw);
+      expect(doc.trainer_config.train_data_loader.num_workers).toBe(defaultHyperparams.dataloaderWorkers);
+      expect(doc.trainer_config.val_data_loader.num_workers).toBe(defaultHyperparams.dataloaderWorkers);
+      expect(doc.trainer_config.trainer_devices).toBe(defaultHyperparams.numDevices);
+    });
+  });
+
+  describe("parseYamlConfig - always resets machine/run fields on import", () => {
+    const yamlWithStaleFields = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  data_pipeline_fw: torch_dataset_cache_img_disk
+trainer_config:
+  run_name: stale_run_from_another_machine
+  trainer_accelerator: mps
+  trainer_devices: 3
+  trainer_strategy: fsdp
+  train_data_loader:
+    num_workers: 8
+`;
+
+    it("blanks runName even when the file has one", () => {
+      const result = useTrainingStore.getState().parseYamlConfig(yamlWithStaleFields, "c.yaml", "centroid");
+      expect(result!.hyperparams.runName).toBe("");
+    });
+
+    it("still detects hasTrainedModel from the file's run_name despite blanking the field", () => {
+      const result = useTrainingStore.getState().parseYamlConfig(yamlWithStaleFields, "c.yaml", "centroid");
+      expect(result!.hasTrainedModel).toBe(true);
+    });
+
+    it("resets accelerator to the default instead of the file's (possibly unavailable) value", () => {
+      const result = useTrainingStore.getState().parseYamlConfig(yamlWithStaleFields, "c.yaml", "centroid");
+      expect(result!.hyperparams.accelerator).toBe(defaultHyperparams.accelerator);
+    });
+
+    it("resets numDevices and dataloaderWorkers to defaults", () => {
+      const result = useTrainingStore.getState().parseYamlConfig(yamlWithStaleFields, "c.yaml", "centroid");
+      expect(result!.hyperparams.numDevices).toBe(defaultHyperparams.numDevices);
+      expect(result!.hyperparams.dataloaderWorkers).toBe(defaultHyperparams.dataloaderWorkers);
+    });
+
+    it("resets dataPipeline to the default instead of the file's value", () => {
+      const result = useTrainingStore.getState().parseYamlConfig(yamlWithStaleFields, "c.yaml", "centroid");
+      expect(result!.hyperparams.dataPipeline).toBe(defaultHyperparams.dataPipeline);
+    });
+
+    it("resets trainerStrategy to the default ('auto') instead of the file's value", () => {
+      // Multi-GPU strategy is machine/topology-specific — a cluster's `fsdp`
+      // must not silently ride onto a single-GPU machine (same rationale as
+      // accelerator/numDevices above).
+      const result = useTrainingStore.getState().parseYamlConfig(yamlWithStaleFields, "c.yaml", "centroid");
+      expect(result!.hyperparams.trainerStrategy).toBe("auto");
+      expect(result!.hyperparams.trainerStrategy).toBe(defaultHyperparams.trainerStrategy);
+    });
+  });
+
+  describe("parseYamlConfig - detects trainingMode from the file's own config", () => {
+    // Regression: "Train Again" wipes config.configs and re-auto-loads each
+    // slot from the just-completed run's own written training_config.yaml
+    // (findTrainedModels prefers the most recent run). Since sleap-nn bakes
+    // resume_ckpt_path/pretrained_*_weights into that file when they were
+    // actually used, trainingMode must be detected from it — otherwise a
+    // Resume/Fine-tune selection always silently reverted to "reuse_config"
+    // on every re-load, even though the run that just finished really did use
+    // it.
+    it("detects 'resume' when the file has a non-empty trainer_config.resume_ckpt_path", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  resume_ckpt_path: /proj/models/prev_run/last.ckpt
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.trainingMode).toBe("resume");
+    });
+
+    it("detects 'finetune' when the file has a non-empty model_config.pretrained_backbone_weights", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+  pretrained_backbone_weights: /proj/models/prev_run/best.ckpt
+  pretrained_head_weights: /proj/models/prev_run/best.ckpt
+trainer_config: {}
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.trainingMode).toBe("finetune");
+    });
+
+    it("defaults to 'reuse_config' when neither field is populated", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.trainingMode).toBe("reuse_config");
+    });
+
+    it("treats a null resume_ckpt_path (never set) as 'reuse_config', not 'resume'", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  resume_ckpt_path: null
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.trainingMode).toBe("reuse_config");
+    });
+  });
+
+  describe("applyHyperparamsToYaml - wandb.name staleness", () => {
+    it("clears a pre-existing wandb.name (no UI field for it) so a stale run id can't ride through", () => {
+      const yamlText = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  use_wandb: true
+  wandb:
+    entity: my-lab
+    project: my-project
+    name: some-old-run-id
+`;
+      const hp = { ...defaultHyperparams, useWandb: true, wandbEntity: "my-lab", wandbProject: "my-project" };
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, hp)) as Record<string, any>;
+      expect(doc.trainer_config.wandb.name).toBeUndefined();
+      expect(doc.trainer_config.wandb.entity).toBe("my-lab");
+      expect(doc.trainer_config.wandb.project).toBe("my-project");
+    });
+  });
+
+  describe("applyHyperparamsToYaml - skeleton erasure", () => {
+    it("erases a skeleton baked into an imported config — sleap-nn re-derives it from the real training data", () => {
+      const yamlText = `
+data_config:
+  skeletons:
+    - nodes:
+        - name: head
+        - name: tail
+      edges: []
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, defaultHyperparams)) as Record<string, any>;
+      expect(doc.data_config.skeletons).toEqual([]);
+    });
+
+    it("clears a cache_img_path baked into an imported config — it may point at another run's directory", () => {
+      const yamlText = `
+data_config:
+  cache_img_path: /proj/models/old_run/train_imgs
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, defaultHyperparams)) as Record<string, any>;
+      expect(doc.data_config.cache_img_path).toBeNull();
+    });
+
+    it("clears part_names baked into an imported config's confmaps head", () => {
+      const yamlText = `
+data_config: {}
+model_config:
+  head_configs:
+    centered_instance:
+      confmaps:
+        sigma: 1.5
+        part_names: ["head", "tail"]
+trainer_config: {}
+`;
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, defaultHyperparams)) as Record<string, any>;
+      expect(doc.model_config.head_configs.centered_instance.confmaps.part_names).toBeNull();
+    });
+
+    it("does not inject a part_names key into a confmaps head that never had one (centroid)", () => {
+      const yamlText = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      confmaps:
+        sigma: 1.5
+trainer_config: {}
+`;
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, defaultHyperparams)) as Record<string, any>;
+      expect("part_names" in doc.model_config.head_configs.centroid.confmaps).toBe(false);
+    });
+  });
+
+  describe("parseYamlConfig - strips skeleton/cache_img_path from stored content at load time", () => {
+    const yamlWithStaleFields = `
+data_config:
+  skeletons:
+    - nodes:
+        - name: head
+        - name: tail
+      edges: []
+  cache_img_path: /proj/models/old_run/train_imgs
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+
+    it("clears skeletons from the stored content, not just at apply time", () => {
+      const result = useTrainingStore.getState().parseYamlConfig(yamlWithStaleFields, "c.yaml", "centroid");
+      const doc = yaml.load(result!.content) as Record<string, any>;
+      expect(doc.data_config.skeletons).toEqual([]);
+    });
+
+    it("clears cache_img_path from the stored content", () => {
+      const result = useTrainingStore.getState().parseYamlConfig(yamlWithStaleFields, "c.yaml", "centroid");
+      const doc = yaml.load(result!.content) as Record<string, any>;
+      expect(doc.data_config.cache_img_path).toBeNull();
+    });
+
+    it("handles a config with no data_config section at all", () => {
+      const noDataConfig = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(noDataConfig, "c.yaml", "centroid");
+      const doc = yaml.load(result!.content) as Record<string, any>;
+      expect(doc.data_config.skeletons).toEqual([]);
+      expect(doc.data_config.cache_img_path).toBeNull();
+    });
+
+    it("clears part_names from the stored content's confmaps head", () => {
+      const yamlWithPartNames = `
+data_config: {}
+model_config:
+  head_configs:
+    centered_instance:
+      confmaps:
+        sigma: 1.5
+        part_names: ["head", "tail"]
+trainer_config: {}
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlWithPartNames, "c.yaml", "centered_instance");
+      const doc = yaml.load(result!.content) as Record<string, any>;
+      expect(doc.model_config.head_configs.centered_instance.confmaps.part_names).toBeNull();
+    });
+  });
+
+  describe("applyHyperparamsToYaml - run_name overwrite", () => {
+    it("overwrites a stale baked-in run_name once a fresh one is resolved", () => {
+      // Simulates the remote-training call site: `hyperparams.runName` is
+      // always blank right after import (parseYamlConfig), but the caller
+      // resolves a fresh name and passes `{ ...hyperparams, runName: fresh }`
+      // into applyHyperparamsToYaml before serializing for the worker — there
+      // is no Hydra CLI-override safety net for remote jobs, so this is the
+      // only thing standing between an imported config's stale run_name and
+      // the actual remote job.
+      const yamlText = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  run_name: stale_run_from_another_machine
+`;
+      const hp = { ...defaultHyperparams, runName: "260818_143022.centroid.n=13" };
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, hp)) as Record<string, any>;
+      expect(doc.trainer_config.run_name).toBe("260818_143022.centroid.n=13");
+    });
+  });
+
+  describe("applyHyperparamsToYaml - checkpoint saving", () => {
+    const baseYaml = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+
+    it("writes save_top_k=1 and save_last=false by default (Best Model on, Latest Model off)", () => {
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, defaultHyperparams)) as Record<string, any>;
+      expect(doc.trainer_config.model_ckpt.save_top_k).toBe(1);
+      expect(doc.trainer_config.model_ckpt.save_last).toBe(false);
+    });
+
+    it("writes save_top_k=0 when Best Model is unchecked", () => {
+      const hp = { ...defaultHyperparams, saveBestModel: false };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.model_ckpt.save_top_k).toBe(0);
+    });
+
+    it("writes save_last=true when Latest Model is checked — this is the last.ckpt fix", () => {
+      const hp = { ...defaultHyperparams, saveLastModel: true };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.model_ckpt.save_last).toBe(true);
+    });
+  });
+
+  describe("applyHyperparamsToYaml - visualization", () => {
+    const baseYaml = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+
+    it("writes both fields true by default (fixes the previously-inert epoch-viz-scrubber)", () => {
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, defaultHyperparams)) as Record<string, any>;
+      expect(doc.trainer_config.visualize_preds_during_training).toBe(true);
+      expect(doc.trainer_config.keep_viz).toBe(true);
+    });
+
+    it("keep_viz is false whenever visualizePredictions is off, regardless of keepVizImages", () => {
+      const hp = { ...defaultHyperparams, visualizePredictions: false, keepVizImages: true };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.visualize_preds_during_training).toBe(false);
+      expect(doc.trainer_config.keep_viz).toBe(false);
+    });
+
+    it("keep_viz is false when keepVizImages is off even if visualizePredictions is on", () => {
+      const hp = { ...defaultHyperparams, visualizePredictions: true, keepVizImages: false };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.keep_viz).toBe(false);
+    });
+  });
+
+  describe("applyHyperparamsToYaml - color conversion", () => {
+    const baseYaml = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+
+    it("writes both ensure_rgb/ensure_grayscale false for 'auto'", () => {
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, defaultHyperparams)) as Record<string, any>;
+      expect(doc.data_config.preprocessing.ensure_rgb).toBe(false);
+      expect(doc.data_config.preprocessing.ensure_grayscale).toBe(false);
+    });
+
+    it("writes ensure_rgb=true for 'rgb'", () => {
+      const hp = { ...defaultHyperparams, colorMode: "rgb" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.data_config.preprocessing.ensure_rgb).toBe(true);
+      expect(doc.data_config.preprocessing.ensure_grayscale).toBe(false);
+    });
+
+    it("writes ensure_grayscale=true for 'grayscale'", () => {
+      const hp = { ...defaultHyperparams, colorMode: "grayscale" as const };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.data_config.preprocessing.ensure_rgb).toBe(false);
+      expect(doc.data_config.preprocessing.ensure_grayscale).toBe(true);
+    });
+  });
+
+  describe("applyHyperparamsToYaml - epoch-end evaluation", () => {
+    it("writes eval.enabled and eval.frequency", () => {
+      const baseYaml = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+      const hp = { ...defaultHyperparams, evalEnabled: true, evalFrequency: 5 };
+      const doc = yaml.load(applyHyperparamsToYaml(baseYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.eval.enabled).toBe(true);
+      expect(doc.trainer_config.eval.frequency).toBe(5);
+    });
+  });
+
+  describe("applyHyperparamsToYaml - W&B extras", () => {
+    it("writes save_viz_imgs_wandb, prv_runid, and group when set", () => {
+      const yamlText = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  use_wandb: true
+`;
+      const hp = {
+        ...defaultHyperparams,
+        useWandb: true,
+        wandbUploadViz: true,
+        wandbPrevRunId: "abc123",
+        wandbGroup: "experiment-1",
+      };
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, hp)) as Record<string, any>;
+      expect(doc.trainer_config.wandb.save_viz_imgs_wandb).toBe(true);
+      expect(doc.trainer_config.wandb.prv_runid).toBe("abc123");
+      expect(doc.trainer_config.wandb.group).toBe("experiment-1");
+    });
+
+    it("writes wandb_mode 'offline' and api_key when set", () => {
+      const yamlText = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  use_wandb: true
+`;
+      const hp = {
+        ...defaultHyperparams,
+        useWandb: true,
+        wandbMode: "offline" as const,
+        wandbApiKey: "secret-key",
+      };
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, hp)) as Record<string, any>;
+      expect(doc.trainer_config.wandb.wandb_mode).toBe("offline");
+      expect(doc.trainer_config.wandb.api_key).toBe("secret-key");
+    });
+
+    it("writes wandb_mode null (online) by default and omits an empty api_key", () => {
+      const yamlText = `
+data_config: {}
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  use_wandb: true
+`;
+      const hp = { ...defaultHyperparams, useWandb: true };
+      const doc = yaml.load(applyHyperparamsToYaml(yamlText, hp)) as Record<string, any>;
+      expect(doc.trainer_config.wandb.wandb_mode).toBeNull();
+      expect(doc.trainer_config.wandb.api_key).toBeUndefined();
+    });
+
+    it("overrides the shipped baseline profile's wandb_mode + api_key (real config round-trip)", () => {
+      const baselinePath = join(
+        import.meta.dir,
+        "../../src/assets/training_profiles/baseline_medium_rf.topdown.yaml"
+      );
+      const baselineYaml = readFileSync(baselinePath, "utf8");
+      const before = yaml.load(baselineYaml) as Record<string, any>;
+      expect(before.trainer_config.wandb.wandb_mode).toBeNull();
+      expect(before.trainer_config.wandb.api_key).toBeNull();
+
+      const hp = { ...defaultHyperparams, useWandb: true, wandbMode: "offline" as const, wandbApiKey: "k" };
+      const doc = yaml.load(applyHyperparamsToYaml(baselineYaml, hp)) as Record<string, any>;
+      expect(doc.trainer_config.wandb.wandb_mode).toBe("offline");
+      expect(doc.trainer_config.wandb.api_key).toBe("k");
+    });
+  });
+
+  describe("parseYamlConfig - new Output/Evaluation/W&B fields", () => {
+    it("applies sensible defaults when the file omits these keys entirely", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config: {}
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.saveBestModel).toBe(true);
+      expect(result!.hyperparams.saveLastModel).toBe(false);
+      expect(result!.hyperparams.visualizePredictions).toBe(true);
+      expect(result!.hyperparams.keepVizImages).toBe(true);
+      expect(result!.hyperparams.colorMode).toBe("auto");
+      expect(result!.hyperparams.evalEnabled).toBe(false);
+      expect(result!.hyperparams.evalFrequency).toBe(1);
+      expect(result!.hyperparams.wandbUploadViz).toBe(false);
+      expect(result!.hyperparams.wandbPrevRunId).toBe("");
+      expect(result!.hyperparams.wandbGroup).toBe("");
+      expect(result!.hyperparams.wandbMode).toBe("online");
+      expect(result!.hyperparams.wandbApiKey).toBe("");
+    });
+
+    it("parses wandb_mode and api_key", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  use_wandb: true
+  wandb:
+    wandb_mode: offline
+    api_key: my-key
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.wandbMode).toBe("offline");
+      expect(result!.hyperparams.wandbApiKey).toBe("my-key");
+    });
+
+    it("respects explicit values in the file, including explicit false overriding the app default", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  model_ckpt:
+    save_top_k: 0
+    save_last: true
+  visualize_preds_during_training: false
+  keep_viz: false
+  eval:
+    enabled: true
+    frequency: 3
+  wandb:
+    save_viz_imgs_wandb: true
+    prv_runid: xyz789
+    group: my-group
+data_config:
+  preprocessing:
+    ensure_rgb: true
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.saveBestModel).toBe(false);
+      expect(result!.hyperparams.saveLastModel).toBe(true);
+      expect(result!.hyperparams.visualizePredictions).toBe(false);
+      expect(result!.hyperparams.keepVizImages).toBe(false);
+      expect(result!.hyperparams.colorMode).toBe("rgb");
+      expect(result!.hyperparams.evalEnabled).toBe(true);
+      expect(result!.hyperparams.evalFrequency).toBe(3);
+      expect(result!.hyperparams.wandbUploadViz).toBe(true);
+      expect(result!.hyperparams.wandbPrevRunId).toBe("xyz789");
+      expect(result!.hyperparams.wandbGroup).toBe("my-group");
+    });
+
+    it("colorMode reads grayscale correctly", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  preprocessing:
+    ensure_grayscale: true
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.colorMode).toBe("grayscale");
+    });
+  });
+
+  describe("parseYamlConfig - data and optimization", () => {
+    it("parses cropSize from preprocessing", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  preprocessing:
+    crop_size: 192
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.cropSize).toBe(192);
+    });
+
+    it("defaults cropSize to null when not present", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config: {}
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.cropSize).toBeNull();
+    });
+
+    it("parses randomSeed from trainer_config.seed", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  seed: 42
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.randomSeed).toBe(42);
+    });
+
+    it("parses stopOnPlateau false", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  early_stopping:
+    stop_training_on_plateau: false
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.stopOnPlateau).toBe(false);
+    });
+
+    it("parses online mining params", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  online_hard_keypoint_mining:
+    online_mining: true
+    min_hard_keypoints: 3
+    max_hard_keypoints: 10
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.onlineMining).toBe(true);
+      expect(result!.hyperparams.minHardKeypoints).toBe(3);
+      expect(result!.hyperparams.maxHardKeypoints).toBe(10);
+    });
+
+    it("parses hard_to_easy_ratio and loss_scale", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  online_hard_keypoint_mining:
+    hard_to_easy_ratio: 3.5
+    loss_scale: 7.0
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.hardToEasyRatio).toBe(3.5);
+      expect(result!.hyperparams.lossScale).toBe(7.0);
+    });
+
+    it("parses plateauMinDelta from early_stopping.min_delta", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+trainer_config:
+  early_stopping:
+    min_delta: 0.001
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.plateauMinDelta).toBe(0.001);
+    });
+  });
+
+  describe("parseYamlConfig - augmentation reverse-map", () => {
+    it("detects rotation ±180° from rotation_min/max", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  augmentation_config:
+    geometric:
+      rotation_min: -180
+      rotation_max: 180
+      affine_p: 1.0
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.rotationPreset).toBe("180");
+    });
+
+    it("detects rotation off from affine_p=0", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  augmentation_config:
+    geometric:
+      rotation_min: 0
+      rotation_max: 0
+      affine_p: 0
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.rotationPreset).toBe("off");
+    });
+
+    it("detects rotation ±15°", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  augmentation_config:
+    geometric:
+      rotation_min: -15
+      rotation_max: 15
+      affine_p: 1.0
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.rotationPreset).toBe("15");
+    });
+
+    it("detects custom rotation from non-standard angles", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  augmentation_config:
+    geometric:
+      rotation_min: -45
+      rotation_max: 45
+      affine_p: 1.0
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.rotationPreset).toBe("custom");
+      expect(result!.hyperparams.rotationCustomAngle).toBe(45);
+    });
+
+    it("detects scale enabled from scale_min != scale_max", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  augmentation_config:
+    geometric:
+      scale_min: 0.9
+      scale_max: 1.1
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.scaleEnabled).toBe(true);
+      expect(result!.hyperparams.scaleMin).toBe(0.9);
+      expect(result!.hyperparams.scaleMax).toBe(1.1);
+    });
+
+    it("detects scale disabled when both are 1.0", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  augmentation_config:
+    geometric:
+      scale_min: 1.0
+      scale_max: 1.0
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.scaleEnabled).toBe(false);
+    });
+
+    it("detects gaussian noise enabled from p > 0", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config:
+  augmentation_config:
+    intensity:
+      gaussian_noise_p: 0.5
+      gaussian_noise_mean: 0.0
+      gaussian_noise_std: 0.04
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.gaussianNoiseEnabled).toBe(true);
+      expect(result!.hyperparams.gaussianNoiseStd).toBe(0.04);
+    });
+
+    it("defaults augmentation fields when no augmentation_config present", () => {
+      const yamlText = `
+model_config:
+  head_configs:
+    centroid:
+      sigma: 1.5
+data_config: {}
+`;
+      const result = useTrainingStore.getState().parseYamlConfig(yamlText, "c.yaml", "centroid");
+      expect(result!.hyperparams.rotationPreset).toBe("180");
+      expect(result!.hyperparams.scaleEnabled).toBe(false);
+      expect(result!.hyperparams.gaussianNoiseEnabled).toBe(false);
+      expect(result!.hyperparams.uniformNoiseEnabled).toBe(false);
+      expect(result!.hyperparams.contrastEnabled).toBe(false);
+      expect(result!.hyperparams.brightnessEnabled).toBe(false);
+    });
+  });
+});
+
+import type { ModelProgress } from "@/stores/trainingStore";
+
+function makeModel(over: Partial<ModelProgress> = {}): ModelProgress {
+  return {
+    label: "Centroid", epoch: 0, maxEpochs: 100, loss: null, valLoss: null,
+    bestValLoss: null, status: "running",
+    epochSamples: [], batchSamples: [],
+    epochSize: 1, lastBatchNumber: 0,
+    metrics: { meanEpochTimeSec: null, etaNext10Min: null, epochsInPlateau: 0, inPlateau: false, bestValEpoch: null },
+    epochStartedAt: null, plateauPatience: 10, plateauMinDelta: null,
+    runDir: null,
+    ...over,
+  };
+}
+
+describe("recordEpoch", () => {
+  beforeEach(() => useTrainingStore.getState().reset());
+
+  it("appends an epoch sample and updates scalars", () => {
+    useTrainingStore.setState({ models: [makeModel()], startedAt: 0 });
+    useTrainingStore.getState().recordEpoch(0, { epoch: 0, trainLoss: 1.0, valLoss: 0.9 });
+    const m = useTrainingStore.getState().models[0];
+    expect(m.epochSamples).toHaveLength(1);
+    expect(m.epochSamples[0]).toEqual({ epoch: 0, trainLoss: 1.0, valLoss: 0.9 });
+    expect(m.epoch).toBe(1);          // PyQt displays epoch+1
+    expect(m.loss).toBe(1.0);
+    expect(m.valLoss).toBe(0.9);
+    expect(m.bestValLoss).toBe(0.9);
+  });
+
+  it("tracks best val loss across epochs and recomputes metrics", () => {
+    useTrainingStore.setState({ models: [makeModel()], startedAt: 0 });
+    const s = useTrainingStore.getState();
+    s.recordEpoch(0, { epoch: 0, trainLoss: 1.0, valLoss: 0.5 });
+    s.recordEpoch(0, { epoch: 1, trainLoss: 0.8, valLoss: 0.6 }); // worse
+    const m = useTrainingStore.getState().models[0];
+    expect(m.bestValLoss).toBe(0.5);
+    expect(m.metrics.bestValEpoch).toBe(0);
+    expect(m.metrics.inPlateau).toBe(true);
+    expect(m.epochSamples).toHaveLength(2);
+  });
+
+  it("ignores out-of-range model index safely", () => {
+    useTrainingStore.setState({ models: [makeModel()], startedAt: 0 });
+    expect(() => useTrainingStore.getState().recordEpoch(5, { epoch: 0, trainLoss: 1, valLoss: 1 })).not.toThrow();
+  });
+
+  it("recordEpoch preserves prior loss/valLoss when a sample field is null", () => {
+    useTrainingStore.setState({ models: [makeModel({ loss: 0.7, valLoss: 0.6, bestValLoss: 0.6 })], startedAt: 0 });
+    useTrainingStore.getState().recordEpoch(0, { epoch: 0, trainLoss: null, valLoss: null });
+    const m = useTrainingStore.getState().models[0];
+    expect(m.loss).toBe(0.7);        // unchanged (sample.trainLoss was null)
+    expect(m.valLoss).toBe(0.6);     // unchanged (sample.valLoss was null)
+    expect(m.bestValLoss).toBe(0.6); // unchanged (no new val loss)
+    expect(m.epochSamples).toHaveLength(1);
+  });
+});
+
+describe("recordBatch / epochSize", () => {
+  beforeEach(() => useTrainingStore.getState().reset());
+
+  it("computes globalBatch = epoch*epochSize + batch (epochSize starts at 1)", () => {
+    useTrainingStore.setState({ models: [makeModel()], startedAt: 0 });
+    useTrainingStore.getState().recordBatch(0, { epoch: 0, batch: 5, loss: 0.4 });
+    const m = useTrainingStore.getState().models[0];
+    expect(m.batchSamples).toEqual([{ globalBatch: 5, loss: 0.4 }]); // 0*1+5
+    expect(m.lastBatchNumber).toBe(5);
+  });
+
+  it("recordEpoch learns epochSize from lastBatchNumber, used by later batches", () => {
+    useTrainingStore.setState({ models: [makeModel()], startedAt: 0 });
+    const s = useTrainingStore.getState();
+    s.recordBatch(0, { epoch: 0, batch: 5, loss: 0.4 });          // lastBatch=5
+    s.recordEpoch(0, { epoch: 0, trainLoss: 0.4, valLoss: 0.5 }); // epochSize = max(1,6) = 6
+    expect(useTrainingStore.getState().models[0].epochSize).toBe(6);
+    s.recordBatch(0, { epoch: 1, batch: 2, loss: 0.3 });          // 1*6+2 = 8
+    const m = useTrainingStore.getState().models[0];
+    expect(m.batchSamples[m.batchSamples.length - 1]).toEqual({ globalBatch: 8, loss: 0.3 });
+  });
+
+  it("recordBatches appends multiple points in one update", () => {
+    useTrainingStore.setState({ models: [makeModel()], startedAt: 0 });
+    useTrainingStore.getState().recordBatches(0, [
+      { epoch: 0, batch: 0, loss: 1.0 },
+      { epoch: 0, batch: 1, loss: 0.9 },
+    ]);
+    expect(useTrainingStore.getState().models[0].batchSamples).toEqual([
+      { globalBatch: 0, loss: 1.0 },
+      { globalBatch: 1, loss: 0.9 },
+    ]);
+  });
+
+  it("ignores out-of-range model index safely", () => {
+    useTrainingStore.setState({ models: [makeModel()], startedAt: 0 });
+    expect(() => useTrainingStore.getState().recordBatch(9, { epoch: 0, batch: 0, loss: 1 })).not.toThrow();
+    expect(() => useTrainingStore.getState().recordBatches(9, [{ epoch: 0, batch: 0, loss: 1 }])).not.toThrow();
+  });
+});
+
+describe("markEpochBegin / epochStartedAt", () => {
+  beforeEach(() => useTrainingStore.getState().reset());
+  it("recordEpoch keeps epochStartedAt (set by epoch_begin)", () => {
+    useTrainingStore.setState({ models: [makeModel({ epochStartedAt: 1000 })], startedAt: 0 });
+    useTrainingStore.getState().recordEpoch(0, { epoch: 0, trainLoss: 1, valLoss: 1 });
+    expect(useTrainingStore.getState().models[0].epochStartedAt).toBe(1000);
+  });
+  it("markEpochBegin sets epoch and stamps epochStartedAt", () => {
+    useTrainingStore.setState({ models: [makeModel()], startedAt: 0 });
+    useTrainingStore.getState().markEpochBegin(0, 3);
+    const m = useTrainingStore.getState().models[0];
+    expect(m.epoch).toBe(3);
+    expect(typeof m.epochStartedAt).toBe("number");
+  });
+
+  describe("mergeStdoutIntoLog (tqdm coalescing)", () => {
+    it("appends normal (non-progress) lines", () => {
+      expect(mergeStdoutIntoLog([], ["hello", "world"])).toEqual(["hello", "world"]);
+    });
+
+    it("coalesces consecutive tqdm progress lines into one in-place line", () => {
+      const out = mergeStdoutIntoLog([], [
+        "Epoch 0:  10%|#         | 2/20 [00:00<00:01, loss=0.5]",
+        "Epoch 0:  50%|#####     | 10/20 [00:01<00:01, loss=0.3]",
+        "Epoch 0: 100%|##########| 20/20 [00:02<00:00, loss=0.1]",
+      ]);
+      expect(out).toEqual(["Epoch 0: 100%|##########| 20/20 [00:02<00:00, loss=0.1]"]);
+    });
+
+    it("keeps non-progress lines that bracket a progress bar", () => {
+      const out = mergeStdoutIntoLog([], [
+        "starting",
+        "Epoch 0:  10%|#         | 2/20",
+        "Epoch 0:  90%|######### | 18/20",
+        "done",
+      ]);
+      expect(out).toEqual(["starting", "Epoch 0:  90%|######### | 18/20", "done"]);
+    });
+
+    it("coalesces across calls (replaces a trailing progress line from prior log)", () => {
+      const first = mergeStdoutIntoLog([], ["Epoch 0:  10%|#         | 2/20"]);
+      const second = mergeStdoutIntoLog(first, ["Epoch 0:  80%|######## | 16/20"]);
+      expect(second).toEqual(["Epoch 0:  80%|######## | 16/20"]);
+    });
+
+    it("strips ANSI escape codes and drops blank lines", () => {
+      const out = mergeStdoutIntoLog([], ["\x1b[32mgreen\x1b[0m", "   ", ""]);
+      expect(out).toEqual(["green"]);
+    });
+  });
+
+  describe("countUserLabeledFrames", () => {
+    const skeleton = new Skeleton({ nodes: ["a"], name: "s" });
+    const video = new Video({
+      filename: "v.mp4",
+      backendMetadata: { shape: [10, 100, 100, 3] },
+      openBackend: false,
+    });
+
+    it("returns null with no project loaded", () => {
+      expect(countUserLabeledFrames(null)).toBeNull();
+    });
+
+    it("counts frames with a user instance, ignores predicted-only frames, includes negative frames", () => {
+      const userFrame = new LabeledFrame({ video, frameIdx: 0 });
+      userFrame.instances.push(Instance.empty({ skeleton }));
+
+      const predictedOnlyFrame = new LabeledFrame({ video, frameIdx: 1 });
+      predictedOnlyFrame.instances.push(
+        new PredictedInstance({
+          skeleton,
+          points: [{ xy: [0, 0], visible: true, complete: true, name: "a", score: 0.9 }],
+          score: 0.9,
+        }),
+      );
+
+      const negativeFrame = new LabeledFrame({ video, frameIdx: 2 });
+      negativeFrame.isNegative = true;
+
+      const emptyFrame = new LabeledFrame({ video, frameIdx: 3 });
+
+      const labels = new Labels({
+        videos: [video],
+        skeletons: [skeleton],
+        labeledFrames: [userFrame, predictedOnlyFrame, negativeFrame, emptyFrame],
+      });
+
+      // user-labeled + negative count, NOT predicted-only or empty
+      expect(countUserLabeledFrames(labels)).toBe(2);
+    });
+
+    it("counts frames with a user box only when asked (box detectors)", () => {
+      const boxFrame = new LabeledFrame({ video, frameIdx: 0 });
+      boxFrame.bboxes.push(new UserBoundingBox({ x1: 0, y1: 0, x2: 10, y2: 10 }));
+      const predBoxFrame = new LabeledFrame({ video, frameIdx: 1 });
+      predBoxFrame.bboxes.push(new PredictedBoundingBox({ x1: 0, y1: 0, x2: 10, y2: 10, score: 0.9 }));
+      const labels = new Labels({ videos: [video], skeletons: [skeleton], labeledFrames: [boxFrame, predBoxFrame] });
+      expect(countUserLabeledFrames(labels)).toBe(0);
+      expect(countUserLabeledFrames(labels, { includeBoxes: true })).toBe(1);
+    });
+
+    it("re-counts after an in-place edit when the version changes", () => {
+      const frame = new LabeledFrame({ video, frameIdx: 0 });
+      const labels = new Labels({ videos: [video], skeletons: [skeleton], labeledFrames: [frame] });
+      expect(countUserLabeledFrames(labels, { includeBoxes: true, version: 1 })).toBe(0);
+      // Draw a box: same Labels object, edited in place, new editSeq.
+      frame.bboxes.push(new UserBoundingBox({ x1: 0, y1: 0, x2: 10, y2: 10 }));
+      expect(countUserLabeledFrames(labels, { includeBoxes: true, version: 1 })).toBe(0); // same version: cached
+      expect(countUserLabeledFrames(labels, { includeBoxes: true, version: 2 })).toBe(1);
+      // Without a version the count is always fresh.
+      expect(countUserLabeledFrames(labels, { includeBoxes: true })).toBe(1);
+    });
+
+    it("caches per labels + version so it isn't re-scanned every render", () => {
+      const frame = new LabeledFrame({ video, frameIdx: 0 });
+      frame.instances.push(Instance.empty({ skeleton }));
+      const labels = new Labels({ videos: [video], skeletons: [skeleton], labeledFrames: [frame] });
+
+      // Spy the allocating `userInstances` filter: the fn ran on every render;
+      // the cache should serve the second call without re-scanning.
+      const proto = Object.getPrototypeOf(labels.labeledFrames[0]);
+      const orig = Object.getOwnPropertyDescriptor(proto, "userInstances")!;
+      let reads = 0;
+      Object.defineProperty(proto, "userInstances", {
+        configurable: true,
+        get() {
+          reads++;
+          return orig.get!.call(this);
+        },
+      });
+      try {
+        expect(countUserLabeledFrames(labels, { version: 7 })).toBe(1);
+        expect(countUserLabeledFrames(labels, { version: 7 })).toBe(1);
+      } finally {
+        Object.defineProperty(proto, "userInstances", orig);
+      }
+      expect(reads).toBe(1); // second call served from cache
+    });
+  });
+});
+
+// At inference the centered-instance model crops around the anchor the CENTROID
+// model finds, so the two configs must name the same anchor_part. The UI's one
+// Anchor Part picker used to update only the centered-instance config.
+describe("top-down anchor part is shared by the centroid and centered-instance configs", () => {
+  const profile = (name: string) =>
+    readFileSync(join(import.meta.dir, "../../src/assets/training_profiles", name), "utf-8");
+  const anchorOf = (text: string, head: string) =>
+    (yaml.load(text) as { model_config: { head_configs: Record<string, { confmaps: { anchor_part: string | null } }> } })
+      .model_config.head_configs[head].confmaps.anchor_part;
+  const hpOf = (slot: string) =>
+    useTrainingStore.getState().config.configs.find((c) => c.slot === slot)!.hyperparams;
+
+  beforeEach(() => {
+    const store = useTrainingStore.getState();
+    store.reset();
+    store.addConfigFile(store.parseYamlConfig(profile("baseline_medium_rf.centroid.yaml"), "centroid.yaml", "centroid")!);
+    store.addConfigFile(store.parseYamlConfig(profile("baseline_medium_rf.topdown.yaml"), "ci.yaml", "centered_instance")!);
+  });
+
+  it("picking an anchor on the centered-instance config also sets the centroid's", () => {
+    useTrainingStore.getState().updateConfigHyperparams("centered_instance", { anchorPart: "thorax" });
+    expect(hpOf("centroid").anchorPart).toBe("thorax");
+    const centroid = useTrainingStore.getState().config.configs.find((c) => c.slot === "centroid")!;
+    expect(anchorOf(applyHyperparamsToYaml(centroid.content, centroid.hyperparams), "centroid")).toBe("thorax");
+  });
+
+  it("clearing the anchor clears both, overwriting a stale anchor_part in the file", () => {
+    const store = useTrainingStore.getState();
+    store.updateConfigHyperparams("centered_instance", { anchorPart: "thorax" });
+    store.updateConfigHyperparams("centered_instance", { anchorPart: null });
+    expect(hpOf("centroid").anchorPart).toBeNull();
+    const stale = profile("baseline_medium_rf.centroid.yaml").replace("anchor_part: null", "anchor_part: thorax");
+    expect(anchorOf(applyHyperparamsToYaml(stale, hpOf("centroid")), "centroid")).toBeNull();
+  });
+
+  it("loading a config that names an anchor sets it for its partner", () => {
+    const store = useTrainingStore.getState();
+    const withAnchor = profile("baseline_medium_rf.topdown.yaml").replace("anchor_part: null", "anchor_part: head");
+    store.addConfigFile(store.parseYamlConfig(withAnchor, "ci.yaml", "centered_instance")!);
+    expect(hpOf("centroid").anchorPart).toBe("head");
+  });
+
+  it("leaves other settings and non-top-down configs alone", () => {
+    useTrainingStore.getState().updateConfigHyperparams("centroid", { sigma: 7 });
+    expect(hpOf("centroid").sigma).toBe(7);
+    expect(hpOf("centered_instance").sigma).not.toBe(7);
+  });
+});
+

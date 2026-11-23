@@ -1,0 +1,231 @@
+/**
+ * Helpers for "navigate labeled frames only" mode (issue #137).
+ *
+ * In this mode, frame stepping / playback / seekbar are confined to the frames
+ * that actually have data, instead of walking the dense frame axis (which is
+ * mostly dead air for sparse `pkg.slp` files). These are pure functions so the
+ * stepping logic can be unit-tested in isolation: the store wires `stepLabeled`
+ * into `incrementFrameIdx`, and the Seekbar uses `nearestFrameInDomain` for
+ * click/drag snapping.
+ */
+
+import type { Labels, Track, Video } from "@/types";
+import { isUserLabeledFrame } from "./frameLabeling";
+
+/**
+ * Sorted, ascending list of frame indices that have a LabeledFrame for the
+ * given video (any instance — user or predicted — or a negative flag). This is the canonical
+ * "included frames" source, matching GoNextLabeledFrame / GoPrevLabeledFrame.
+ *
+ * Structured to accept an optional per-frame predicate later (e.g. an
+ * "image is actually available" gate for the deferred imaged-only sub-setting
+ * in #137); today it returns every labeled frame for the video.
+ */
+export function labeledFrameIndices(
+  labels: Labels | null,
+  video: Video | null
+): number[] {
+  if (!labels || !video) return [];
+  return labels
+    .find({ video })
+    // Skip empty LabeledFrames (no instances) — e.g. pkg.slp leftovers after
+    // removing predictions. They have no image, so navigating to one shows a
+    // frozen frame. A negative (background) frame is empty on purpose and
+    // counts as labeled (SLEAP #2894), so it stays.
+    .filter((lf) => lf.instances.length > 0 || lf.isNegative)
+    .map((lf) => lf.frameIdx)
+    .sort((a, b) => a - b);
+}
+
+/**
+ * Sorted, ascending list of ALL LabeledFrame indices for the video, INCLUDING
+ * empty frames (no instances). Backs the `GoNext/PrevLabeledFrame` commands,
+ * which intentionally keep empty frames (PyQt parity — they are still labeled
+ * frames). Deliberately distinct from {@link labeledFrameIndices}, which drops
+ * empty frames for #137 confined navigation (an empty frame has no image, so
+ * stepping onto one in confined mode shows a frozen frame).
+ */
+export function allLabeledFrameIndices(
+  labels: Labels | null,
+  video: Video | null
+): number[] {
+  if (!labels || !video) return [];
+  return labels
+    .find({ video })
+    .map((lf) => lf.frameIdx)
+    .sort((a, b) => a - b);
+}
+
+/**
+ * Sorted, ascending frame indices the USER labeled (see `isUserLabeledFrame`:
+ * user instances / centroid / bbox / mask / negative flag — never
+ * predicted-only or empty frames) for the video. Backs `GoNext/PrevUserFrame`.
+ */
+export function userLabeledFrameIndices(
+  labels: Labels | null,
+  video: Video | null
+): number[] {
+  if (!labels || !video) return [];
+  return labels
+    .find({ video })
+    .filter((lf) => isUserLabeledFrame(lf))
+    .map((lf) => lf.frameIdx)
+    .sort((a, b) => a - b);
+}
+
+/**
+ * Sorted, ascending, deduped frame indices where a track first appears
+ * ("spawns") in the video — the first frame index carrying each of
+ * `labels.tracks`. Backs `GoNextTrackSpawnFrame`. A single pass over the
+ * video's frames finds every track's earliest frame at once (equivalent to the
+ * old per-track rescan, but O(frames × instances) instead of
+ * O(tracks × frames × instances)); instances carrying a track not in
+ * `labels.tracks` are ignored, matching the command's original behavior.
+ */
+export function trackSpawnFrameIndices(
+  labels: Labels | null,
+  video: Video | null
+): number[] {
+  if (!labels || !video) return [];
+  const validTracks = new Set<Track>(labels.tracks);
+  if (validTracks.size === 0) return [];
+  const earliest = new Map<Track, number>();
+  for (const lf of labels.find({ video })) {
+    for (const inst of lf.instances) {
+      const track = inst.track;
+      if (!track || !validTracks.has(track)) continue;
+      const prev = earliest.get(track);
+      if (prev === undefined || lf.frameIdx < prev) {
+        earliest.set(track, lf.frameIdx);
+      }
+    }
+  }
+  return [...new Set(earliest.values())].sort((a, b) => a - b);
+}
+
+/**
+ * Step within a sorted domain of frame indices, generalizing the ±1
+ * GoNext/PrevLabeledFrame wraparound to any step size.
+ *
+ * - Forward (`step > 0`): land on the first entry strictly greater than
+ *   `current`, then advance `step - 1` more positions.
+ * - Backward (`step < 0`): land on the last entry strictly less than `current`,
+ *   then retreat `|step| - 1` more positions.
+ * - Wraps end→start and start→end, matching the existing labeled-frame commands.
+ *
+ * Works whether or not `current` is itself in the domain (e.g. parked on an
+ * unlabeled frame after a non-snapped scrub). Returns `null` only when the
+ * domain is empty, signaling the caller to fall back to dense navigation.
+ */
+export function stepLabeled(
+  domain: number[],
+  current: number,
+  step: number
+): number | null {
+  const n = domain.length;
+  if (n === 0) return null;
+  if (step === 0) return current;
+
+  if (step > 0) {
+    // Index of the first entry strictly greater than `current`; wrap to 0.
+    let p = domain.findIndex((idx) => idx > current);
+    if (p === -1) p = 0;
+    p = (p + (step - 1)) % n;
+    return domain[p];
+  }
+
+  // step < 0: index of the last entry strictly less than `current`; wrap to last.
+  let p = -1;
+  for (let i = n - 1; i >= 0; i--) {
+    if (domain[i] < current) {
+      p = i;
+      break;
+    }
+  }
+  if (p === -1) p = n - 1;
+  // (step + 1) <= 0 here; positive-modulo keeps the index in range.
+  p = (((p + (step + 1)) % n) + n) % n;
+  return domain[p];
+}
+
+/**
+ * The entry in a sorted domain closest to `target` (by absolute frame
+ * distance; ties resolve to the lower index). Used to snap seekbar clicks/drag
+ * to a labeled frame in labeled-only mode — on a linear axis, nearest in frame
+ * space equals nearest in pixel space. Returns `null` for an empty domain.
+ */
+export function nearestFrameInDomain(
+  domain: number[],
+  target: number
+): number | null {
+  const n = domain.length;
+  if (n === 0) return null;
+  let best = domain[0];
+  let bestDist = Math.abs(domain[0] - target);
+  for (let i = 1; i < n; i++) {
+    const dist = Math.abs(domain[i] - target);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = domain[i];
+    }
+  }
+  return best;
+}
+
+/** Which frames navigation steps through (#137). */
+export type NavigationDomain = "all" | "labeled" | "suggested" | "imaged";
+
+/**
+ * Sorted, unique frame indices of `video`'s labeling suggestions (the
+ * Suggestions panel's list) — the "suggested frames only" domain.
+ */
+export function suggestedFrameIndices(labels: Labels | null, video: Video | null): number[] {
+  if (!labels || !video) return [];
+  const frames = new Set<number>();
+  for (const s of labels.suggestions ?? []) {
+    if (s.video === video) frames.add(s.frameIdx);
+  }
+  return [...frames].sort((a, b) => a - b);
+}
+
+/**
+ * Sorted, ascending frame indices that have an available image for `video`, or
+ * `null` when every frame is imaged (a continuous video) or the set is unknown.
+ *
+ * The "imaged frames only" counterpart of {@link labeledFrameIndices}: it
+ * delegates to sleap-io.js `Video.embeddedFrameIndices`, which returns the
+ * stored `frame_numbers` for an embedded-image video (`pkg.slp`) and `null` for
+ * a normal full video (where the caller should impose no restriction).
+ */
+export function imagedFrameIndices(video: Video | null): number[] | null {
+  return video?.embeddedFrameIndices ?? null;
+}
+
+/**
+ * The frame-index domain navigation is confined to for the given mode, or
+ * `null` for "no restriction" (dense stepping across every frame):
+ * - `"all"`     → `null`
+ * - `"labeled"` → frames with a LabeledFrame (possibly empty)
+ * - `"suggested"` → the video's labeling suggestions
+ * - `"imaged"`  → frames with a stored image, or `null` if every frame is imaged
+ *
+ * An empty array means "restricted, but nothing to visit" — callers fall back
+ * to dense stepping so the user is never trapped (see `incrementFrameIdx`).
+ */
+export function navigableDomain(
+  labels: Labels | null,
+  video: Video | null,
+  mode: NavigationDomain
+): number[] | null {
+  switch (mode) {
+    case "labeled":
+      return labeledFrameIndices(labels, video);
+    case "suggested":
+      return suggestedFrameIndices(labels, video);
+    case "imaged":
+      return imagedFrameIndices(video);
+    case "all":
+    default:
+      return null;
+  }
+}

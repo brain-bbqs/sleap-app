@@ -1,0 +1,23 @@
+{
+  // Type-checks the test suite (not covered by `tsc -b`, which only checks
+  // src + vite.config). Extends the app config so tests resolve `@/*` and the
+  // same lib/strictness, but adds bun's types so `bun:test` (describe/it/expect)
+  // and the bun globals used by the shim resolve. `types` fully overrides the
+  // parent's, so re-list "vite/client" (for import.meta.env) alongside "bun".
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.test.tsbuildinfo",
+    "types": ["vite/client", "bun"],
+    "noEmit": true
+  },
+  // `include` overrides (does not merge with) the parent's ["src"], so ambient
+  // declaration files under src/ are not auto-loaded here. Explicitly include
+  // the ones tests transitively rely on:
+  //   - src/globals.d.ts: build-time globals (e.g. __APP_VERSION__, used by
+  //     src/hooks/useWindowTitle.ts which the tests import).
+  //   - src/tinykeys.d.ts: the ambient `declare module "tinykeys"` typing used
+  //     by src/hooks/useKeyboardShortcuts.ts; without it, tests that import the
+  //     shortcuts hook see `tinykeys` as `any` (implicit-any errors on every
+  //     handler), even though the app build resolves it via `include: ["src"]`.
+  "include": ["tests", "tests/**/*", "src/globals.d.ts", "src/tinykeys.d.ts"]
+}

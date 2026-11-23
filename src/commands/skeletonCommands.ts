@@ -1,0 +1,956 @@
+/**
+ * Skeleton editing commands with undo/redo support.
+ *
+ * Each command snapshots the skeleton state (nodes, edges) and all instance
+ * points before mutation so that undo restores the full skeleton + instance
+ * data consistently.
+ */
+
+import { Node, Edge, Instance, Skeleton, Symmetry } from "@talmolab/sleap-io.js";
+import type { Labels } from "@talmolab/sleap-io.js";
+import { UpdateTopic } from "../types";
+import type { Command } from "./types";
+import type { CommandContext } from "./CommandContext";
+import {
+  SKELETON_TEMPLATES,
+  type SkeletonTemplate,
+} from "../lib/skeletonTemplates";
+import { remapInstancePoints } from "../lib/skeletonIO";
+import { dirtyFrameTracker } from "../lib/autosaveDirty";
+import { sameSkeletonStructure } from "../lib/skeletonStructure";
+
+// ---------------------------------------------------------------------------
+// Snapshot helpers
+// ---------------------------------------------------------------------------
+
+/** Snapshot of skeleton + all instance points for undo. */
+interface SkeletonSnapshot {
+  /**
+   * The skeleton this snapshot was taken for. A project can hold several
+   * skeletons and the active one can change between an edit and its undo, so
+   * restore targets THIS skeleton, not whichever is active at undo time.
+   */
+  skeleton: Skeleton | null;
+  /** The skeleton's name (so renaming a skeleton is undoable too). */
+  name: string | undefined;
+  /** True when the project had at most one skeleton when this was taken. */
+  singleSkeleton: boolean;
+  nodes: Node[];
+  edges: Edge[];
+  symmetries: Symmetry[];
+  /** For each labeled frame, the points arrays for every instance. */
+  instancePoints: {
+    instance: Instance;
+    /** The instance's own skeleton when the snapshot was taken. */
+    skeleton: Skeleton;
+    points: Instance["points"];
+  }[];
+}
+
+/**
+ * Whether a skeleton edit should touch `inst`. In a project with several
+ * skeletons, only instances OF the edited skeleton change (points are stored
+ * positionally, so adding a mouse node to a pellet instance would corrupt it).
+ * With one skeleton (or none) every instance is touched, exactly as before
+ * multi-skeleton support — including stray instances whose skeleton object
+ * isn't in `labels.skeletons`.
+ */
+export function instanceUsesSkeleton(
+  labels: Pick<Labels, "skeletons"> | null,
+  inst: Instance,
+  skeleton: Skeleton,
+): boolean {
+  if (!labels || labels.skeletons.length <= 1) return true;
+  return inst.skeleton === skeleton;
+}
+
+/** Deep-clone a single point. */
+function clonePoint(p: Instance["points"][0]): Instance["points"][0] {
+  return {
+    xy: [p.xy[0], p.xy[1]] as [number, number],
+    visible: p.visible,
+    complete: p.complete,
+    // Preserve the per-point prediction score so it survives a skeleton-edit
+    // undo/redo round-trip (predicted instances carry it; user points leave it
+    // undefined). Without this, undoing a skeleton edit silently dropped scores.
+    score: p.score,
+    name: p.name,
+  };
+}
+
+/**
+ * Take a snapshot of a skeleton (the active one by default) and all instance
+ * points.
+ */
+function takeSkeletonSnapshot(
+  ctx: CommandContext,
+  skeleton: Skeleton | null = ctx.state.skeleton,
+): SkeletonSnapshot {
+  const { labels } = ctx.state;
+  const nodes = skeleton ? [...skeleton.nodes] : [];
+  const edges = skeleton ? [...skeleton.edges] : [];
+  const symmetries = skeleton ? [...skeleton.symmetries] : [];
+
+  const instancePoints: SkeletonSnapshot["instancePoints"] = [];
+  if (labels) {
+    for (const lf of labels.labeledFrames) {
+      for (const inst of lf.instances) {
+        instancePoints.push({
+          instance: inst,
+          skeleton: inst.skeleton,
+          points: inst.points.map(clonePoint),
+        });
+      }
+    }
+  }
+
+  return {
+    skeleton,
+    name: skeleton?.name,
+    singleSkeleton: !labels || labels.skeletons.length <= 1,
+    nodes,
+    edges,
+    symmetries,
+    instancePoints,
+  };
+}
+
+/**
+ * Identical duplicate skeletons (old files, some merges) are the same skeleton
+ * to the user. Before editing `skeleton`, if every skeleton an instance uses is
+ * structurally identical to it, point all those instances at `skeleton` so the
+ * edit keeps them consistent (and the leftover duplicate object, now unused,
+ * doesn't turn the project into a "several skeletons" one). This is what
+ * `main` effectively did: it edited every instance and re-pointed them on
+ * Open Skeleton / templates / undo. Nothing is removed from labels.skeletons.
+ */
+function absorbIdenticalDuplicates(
+  labels: Labels | null,
+  skeleton: Skeleton | null,
+): void {
+  if (!labels || !skeleton || labels.skeletons.length <= 1) return;
+  const used = new Set<Skeleton>();
+  for (const lf of labels.labeledFrames) {
+    for (const inst of lf.instances) used.add(inst.skeleton);
+  }
+  for (const sk of used) {
+    if (!sameSkeletonStructure(skeleton, sk)) return; // genuinely different
+  }
+  for (const lf of labels.labeledFrames) {
+    for (const inst of lf.instances) {
+      if (inst.skeleton !== skeleton) inst.skeleton = skeleton;
+    }
+  }
+}
+
+/** Start a skeleton edit: fold in identical duplicates, then snapshot. */
+function beginSkeletonEdit(
+  ctx: CommandContext,
+  skeleton: Skeleton | null = ctx.state.skeleton,
+): SkeletonSnapshot {
+  absorbIdenticalDuplicates(ctx.state.labels, skeleton);
+  return takeSkeletonSnapshot(ctx, skeleton);
+}
+
+/** Restore skeleton state from a snapshot. */
+function restoreSkeletonSnapshot(
+  ctx: CommandContext,
+  snapshot: SkeletonSnapshot
+) {
+  const { labels } = ctx.state;
+  const skeleton = snapshot.skeleton;
+  if (!skeleton) return;
+
+  skeleton.name = snapshot.name;
+  skeleton.nodes = snapshot.nodes;
+  skeleton.edges = snapshot.edges;
+  skeleton.symmetries = snapshot.symmetries;
+  skeleton.rebuildCache(skeleton.nodes);
+  // Single-skeleton projects re-point every instance at the skeleton (the
+  // original behavior); with several, each instance keeps its own skeleton.
+  const ownerOf = (entry: SkeletonSnapshot["instancePoints"][number]) =>
+    snapshot.singleSkeleton ? skeleton : entry.skeleton;
+
+  // Restore instance points AND re-point every instance at the restored
+  // skeleton. The snapshot's `instancePoints` is captured in
+  // `labeledFrames` → `instances` iteration order; we re-walk the CURRENT live
+  // instances in that same order and assign positionally. This matters because
+  // the frame-level undo (run just before this, via the interceptor) replaces
+  // `labels.labeledFrames` with fresh clones — the original `entry.instance`
+  // refs are detached, so writing to them would leave the live clones holding
+  // stale (post-mutation) points inconsistent with the restored skeleton.
+  let restoredPositionally = false;
+  if (labels) {
+    const liveInstances: Instance[] = [];
+    for (const lf of labels.labeledFrames) {
+      for (const inst of lf.instances) liveInstances.push(inst);
+    }
+    if (liveInstances.length === snapshot.instancePoints.length) {
+      for (let i = 0; i < liveInstances.length; i++) {
+        liveInstances[i].points = snapshot.instancePoints[i].points.map(
+          clonePoint
+        );
+        liveInstances[i].skeleton = ownerOf(snapshot.instancePoints[i]);
+      }
+      restoredPositionally = true;
+    }
+  }
+
+  // Fallback: assign onto the captured instance refs (legacy behavior) when the
+  // live layout doesn't line up positionally.
+  if (!restoredPositionally) {
+    for (const entry of snapshot.instancePoints) {
+      entry.instance.points = entry.points.map(clonePoint);
+      entry.instance.skeleton = ownerOf(entry);
+    }
+  }
+
+  ctx.state.markChanged();
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+/**
+ * Add a node to the skeleton.
+ *
+ * Also adds a corresponding NaN point to every existing instance so that
+ * point arrays stay aligned with the skeleton node list.
+ *
+ * Params: { name: string }
+ */
+export const AddNodeCommand: Command = {
+  name: "AddNode",
+  topics: [UpdateTopic.Skeleton, UpdateTopic.Frame],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, skeleton } = ctx.state;
+    if (!skeleton) return;
+
+    const name = params?.name as string | undefined;
+    if (!name?.trim()) return;
+
+    // Snapshot before mutation
+    const before = beginSkeletonEdit(ctx);
+    ctx.pushUndoSnapshot({
+      commandName: "AddNode",
+      frame: null,
+      allFrames: null,
+      scopedFrames: null,
+      tracks: labels ? [...labels.tracks] : [],
+      trackNames: labels ? labels.tracks.map((t) => t.name) : [],
+      videos: labels ? [...labels.videos] : [],
+      skeletons: labels ? [...labels.skeletons] : [],
+      suggestions: labels ? [...labels.suggestions] : [],
+      selectedIdx: -1,
+      activeVideo: ctx.state.video,
+      activeFrameIdx: ctx.state.frameIdx,
+    });
+
+    // Store the before snapshot for undo via a closure-based approach:
+    // We'll use the CommandContext's undo system which restores via restoreSnapshot.
+    // But since skeleton changes aren't captured by the standard snapshot system,
+    // we need to intercept undo. We'll store the before state and register a
+    // custom restore. However, the existing undo system works on instance frames,
+    // not skeleton. So we manually manage undo by popping the auto-snapshot and
+    // pushing our own.
+
+    // Actually, since we set skipAutoSnapshot and pushed our own snapshot above,
+    // the standard undo will restore frame/track state. But we also need to
+    // restore skeleton state. The simplest approach: mutate the skeleton and
+    // instances in-place, and let the undo system handle frame-level restore.
+    // For skeleton state, we'll need to hook into undo ourselves.
+
+    // Simpler approach: since the undo stack snapshot doesn't capture skeleton
+    // state, we pop the snapshot we just pushed and instead do a manual
+    // before/after that includes skeleton state.
+
+    // Pop the snapshot we pushed
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const undoStack = (ctx as any).undoStack as unknown[];
+    if (undoStack) undoStack.pop();
+
+    // Add the node
+    const newNode = new Node(name.trim());
+    skeleton.nodes.push(newNode);
+    skeleton.rebuildCache(skeleton.nodes);
+
+    // Add a NaN point to every instance of this skeleton
+    if (labels) {
+      for (const lf of labels.labeledFrames) {
+        for (const inst of lf.instances) {
+          if (!instanceUsesSkeleton(labels, inst, skeleton)) continue;
+          // Reassign, don't push: since sleap-io.js 0.5.x `inst.points` is a
+          // columnar-backed snapshot array, so an in-place `.push()` is dropped.
+          // Element writes go through proxies, but structural changes must set
+          // `inst.points` to a fresh array.
+          inst.points = [
+            ...inst.points.map(clonePoint),
+            {
+              xy: [NaN, NaN] as [number, number],
+              visible: false,
+              complete: false,
+              name: newNode.name,
+            },
+          ];
+        }
+      }
+    }
+
+    // Store before snapshot for manual undo
+    const afterSnapshot = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "AddNode", before, afterSnapshot);
+
+    ctx.state.markChanged();
+    // Node count changed: refresh skeleton-dependent UI (e.g. the Add Instance
+    // affordances, which are gated on the skeleton having at least one node).
+    ctx.state.bumpOverlayVersion();
+  },
+};
+
+/**
+ * Delete a node from the skeleton.
+ *
+ * Removes the node, any edges referencing it, and the corresponding point
+ * from every instance.
+ *
+ * Params: { nodeIdx: number }
+ */
+export const DeleteNodeCommand: Command = {
+  name: "DeleteNode",
+  topics: [UpdateTopic.Skeleton, UpdateTopic.Frame],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, skeleton } = ctx.state;
+    if (!skeleton) return;
+
+    const nodeIdx = params?.nodeIdx as number | undefined;
+    if (nodeIdx === undefined || nodeIdx < 0 || nodeIdx >= skeleton.nodes.length)
+      return;
+
+    const before = beginSkeletonEdit(ctx);
+
+    const node = skeleton.nodes[nodeIdx];
+
+    // Remove edges referencing this node
+    skeleton.edges = skeleton.edges.filter(
+      (e) => e.source !== node && e.destination !== node
+    );
+
+    // Remove the node
+    skeleton.nodes.splice(nodeIdx, 1);
+    skeleton.rebuildCache(skeleton.nodes);
+
+    // Remove corresponding point from every instance of this skeleton
+    if (labels) {
+      for (const lf of labels.labeledFrames) {
+        for (const inst of lf.instances) {
+          if (!instanceUsesSkeleton(labels, inst, skeleton)) continue;
+          if (nodeIdx < inst.points.length) {
+            // Reassign, don't splice in place: `inst.points` is a columnar
+            // snapshot array since sleap-io.js 0.5.x (see AddNode).
+            const kept = inst.points.map(clonePoint);
+            kept.splice(nodeIdx, 1);
+            inst.points = kept;
+          }
+        }
+      }
+    }
+
+    const afterSnapshot = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "DeleteNode", before, afterSnapshot);
+
+    ctx.state.markChanged();
+    // Node count changed: refresh skeleton-dependent UI (see AddNode).
+    ctx.state.bumpOverlayVersion();
+  },
+};
+
+/**
+ * Add an edge between two nodes.
+ *
+ * Params: { srcName: string, dstName: string }
+ */
+export const AddEdgeCommand: Command = {
+  name: "AddEdge",
+  topics: [UpdateTopic.Skeleton],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { skeleton } = ctx.state;
+    if (!skeleton) return;
+
+    const srcName = params?.srcName as string | undefined;
+    const dstName = params?.dstName as string | undefined;
+    if (!srcName || !dstName) return;
+
+    const src = skeleton.nodes.find((n) => n.name === srcName);
+    const dst = skeleton.nodes.find((n) => n.name === dstName);
+    if (!src || !dst) return;
+
+    const before = beginSkeletonEdit(ctx);
+
+    skeleton.edges.push(new Edge(src, dst));
+
+    const afterSnapshot = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "AddEdge", before, afterSnapshot);
+
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Delete an edge from the skeleton.
+ *
+ * Params: { edgeIdx: number }
+ */
+export const DeleteEdgeCommand: Command = {
+  name: "DeleteEdge",
+  topics: [UpdateTopic.Skeleton],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { skeleton } = ctx.state;
+    if (!skeleton) return;
+
+    const edgeIdx = params?.edgeIdx as number | undefined;
+    if (edgeIdx === undefined || edgeIdx < 0 || edgeIdx >= skeleton.edges.length)
+      return;
+
+    const before = beginSkeletonEdit(ctx);
+
+    skeleton.edges.splice(edgeIdx, 1);
+
+    const afterSnapshot = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "DeleteEdge", before, afterSnapshot);
+
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Remove all edges from the skeleton, keeping the nodes. Used by the visual
+ * builder's "Clear edges" reset. Undoable.
+ */
+export const ClearEdgesCommand: Command = {
+  name: "ClearEdges",
+  topics: [UpdateTopic.Skeleton],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext) {
+    const { skeleton } = ctx.state;
+    if (!skeleton || skeleton.edges.length === 0) return;
+
+    const before = beginSkeletonEdit(ctx);
+    skeleton.edges = [];
+    const afterSnapshot = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "ClearEdges", before, afterSnapshot);
+
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Delete the entire skeleton: remove all nodes and edges, and clear every
+ * instance's points. An empty skeleton implies zero points per instance, so
+ * this cascades to instance points the same way {@link DeleteNodeCommand} does
+ * for a single node — but for ALL nodes at once (each instance's `points`
+ * becomes `[]`).
+ *
+ * No-op when there is no skeleton or it is already empty (0 nodes AND 0 edges).
+ * Undoable via the snapshot pattern (nodes, edges, and instance points all
+ * restore).
+ */
+export const DeleteSkeletonCommand: Command = {
+  name: "DeleteSkeleton",
+  topics: [UpdateTopic.Skeleton, UpdateTopic.Frame],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext) {
+    const { labels, skeleton } = ctx.state;
+    if (!skeleton) return;
+    // Already empty → nothing to do (no undo entry pushed).
+    if (skeleton.nodes.length === 0 && skeleton.edges.length === 0) return;
+
+    const before = beginSkeletonEdit(ctx);
+
+    skeleton.nodes = [];
+    skeleton.edges = [];
+    skeleton.rebuildCache([]);
+
+    // Clear every instance's points. Reassign, don't splice in place:
+    // `inst.points` is a columnar snapshot array since sleap-io.js 0.5.x (see
+    // AddNode/DeleteNode).
+    if (labels) {
+      for (const lf of labels.labeledFrames) {
+        for (const inst of lf.instances) {
+          if (!instanceUsesSkeleton(labels, inst, skeleton)) continue;
+          inst.points = [];
+        }
+      }
+    }
+
+    const afterSnapshot = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "DeleteSkeleton", before, afterSnapshot);
+
+    ctx.state.markChanged();
+    // Node count changed: refresh skeleton-dependent UI (see AddNode).
+    ctx.state.bumpOverlayVersion();
+  },
+};
+
+/**
+ * Rename a node in the skeleton.
+ *
+ * Also updates the name in all instance point arrays.
+ *
+ * Params: { nodeIdx: number, newName: string }
+ */
+export const RenameNodeCommand: Command = {
+  name: "RenameNode",
+  topics: [UpdateTopic.Skeleton],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, skeleton } = ctx.state;
+    if (!skeleton) return;
+
+    const nodeIdx = params?.nodeIdx as number | undefined;
+    const newName = params?.newName as string | undefined;
+    if (
+      nodeIdx === undefined ||
+      nodeIdx < 0 ||
+      nodeIdx >= skeleton.nodes.length
+    )
+      return;
+    if (!newName?.trim()) return;
+
+    const before = beginSkeletonEdit(ctx);
+
+    const node = skeleton.nodes[nodeIdx];
+    node.name = newName.trim();
+    skeleton.rebuildCache(skeleton.nodes);
+
+    // Update point names in all instances of this skeleton
+    if (labels) {
+      for (const lf of labels.labeledFrames) {
+        for (const inst of lf.instances) {
+          if (!instanceUsesSkeleton(labels, inst, skeleton)) continue;
+          if (nodeIdx < inst.points.length) {
+            inst.points[nodeIdx].name = newName.trim();
+          }
+        }
+      }
+    }
+
+    const afterSnapshot = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "RenameNode", before, afterSnapshot);
+
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Load a skeleton template, replacing the current skeleton.
+ *
+ * Params: { templateId: string }
+ */
+export const LoadSkeletonTemplateCommand: Command = {
+  name: "LoadSkeletonTemplate",
+  topics: [UpdateTopic.Skeleton, UpdateTopic.Frame],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, skeleton } = ctx.state;
+    if (!skeleton || !labels) return;
+
+    const templateId = params?.templateId as string | undefined;
+    if (!templateId) return;
+
+    const template = SKELETON_TEMPLATES[templateId];
+    if (!template) return;
+
+    const before = beginSkeletonEdit(ctx);
+
+    applyTemplate(skeleton, template, labels);
+
+    const afterSnapshot = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "LoadSkeletonTemplate", before, afterSnapshot);
+
+    ctx.state.markChanged();
+    // Node count changed: refresh skeleton-dependent UI (see AddNode).
+    ctx.state.bumpOverlayVersion();
+  },
+};
+
+/**
+ * Import a parsed skeleton onto the project's active skeleton **in place**,
+ * preserving instance points by node name (or by an explicit rename `linkMap`).
+ *
+ * Port of PyQt SLEAP `OpenSkeleton.do_action` (Cases 1 + 2): the existing
+ * skeleton OBJECT is rebuilt (nodes/edges/symmetries replaced) — it is NOT
+ * appended/replaced in `labels.skeletons`, so every reference stays valid and
+ * the #99 multi-skeleton footgun is avoided. Each instance's points are remapped
+ * via {@link remapInstancePoints}: matched/linked nodes keep their xy, brand-new
+ * nodes get NaN points, and dropped nodes' points are discarded.
+ *
+ * Params:
+ *   - `newSkeleton: Skeleton`  — the parsed skeleton to import.
+ *   - `linkMap?: Map<string,string>` — newName → oldName explicit links (rename).
+ */
+export const OpenSkeletonCommand: Command = {
+  name: "OpenSkeleton",
+  topics: [UpdateTopic.Skeleton, UpdateTopic.Frame],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, skeleton } = ctx.state;
+    if (!skeleton || !labels) return;
+
+    const newSkeleton = params?.newSkeleton as Skeleton | undefined;
+    if (!newSkeleton) return;
+    const linkMap =
+      (params?.linkMap as Map<string, string> | undefined) ?? new Map();
+
+    const before = beginSkeletonEdit(ctx);
+
+    // Source nodes for the point remap (the pre-import layout).
+    const oldNodes = [...skeleton.nodes];
+
+    // Rebuild the skeleton in place: keep the SAME object so its slot in
+    // labels.skeletons stays valid (no append/replace).
+    const newNodes = newSkeleton.nodes.map((n) => new Node(n.name));
+    skeleton.nodes = newNodes;
+
+    const byName = (nodes: Node[], name: string): Node => {
+      const found = nodes.find((n) => n.name === name);
+      // Imported edges always reference imported nodes by name, so this is
+      // defined in practice; fall back to a fresh Node to stay total.
+      return found ?? new Node(name);
+    };
+
+    skeleton.edges = newSkeleton.edges.map(
+      (e) =>
+        new Edge(
+          byName(newNodes, e.source.name),
+          byName(newNodes, e.destination.name),
+        ),
+    );
+
+    // Rebuild the name/index cache before recreating symmetries by name —
+    // addSymmetry() resolves node names against this cache.
+    skeleton.rebuildCache(skeleton.nodes);
+
+    // Symmetries (best-effort): recreate by name on the existing skeleton.
+    // Templates have none, so this is usually a no-op. Mirrors the PyQt
+    // `try_and_skip_if_error` pattern — never let a bad symmetry abort the import.
+    skeleton.symmetries = [];
+    for (const [leftName, rightName] of newSkeleton.symmetryNames) {
+      try {
+        skeleton.addSymmetry(leftName, rightName);
+      } catch {
+        // skip a symmetry that can't be recreated
+      }
+    }
+
+    // Remap every instance's points by name/link, then re-point at the skeleton.
+    for (const lf of labels.labeledFrames) {
+      for (const inst of lf.instances) {
+        if (!instanceUsesSkeleton(labels, inst, skeleton)) continue;
+        inst.points = remapInstancePoints(inst, oldNodes, newNodes, linkMap);
+        inst.skeleton = skeleton;
+      }
+    }
+
+    const after = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "OpenSkeleton", before, after);
+
+    ctx.state.markChanged();
+    // Node count changed: refresh skeleton-dependent UI (see AddNode).
+    ctx.state.bumpOverlayVersion();
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Apply a template to the skeleton, rebuilding nodes/edges and instance points. */
+function applyTemplate(
+  skeleton: Skeleton,
+  template: SkeletonTemplate,
+  labels: Pick<Labels, "skeletons"> & { labeledFrames: { instances: Instance[] }[] }
+) {
+  // Create new nodes
+  const newNodes = template.nodes.map((name) => new Node(name));
+  skeleton.nodes = newNodes;
+
+  // Create new edges
+  skeleton.edges = template.edges.map(
+    ([srcIdx, dstIdx]) => new Edge(newNodes[srcIdx], newNodes[dstIdx])
+  );
+
+  skeleton.rebuildCache(skeleton.nodes);
+
+  // Replace the old symmetries too: left as they were, they'd still pair the
+  // previous skeleton's nodes. addSymmetry() resolves names against the cache.
+  skeleton.symmetries = [];
+  for (const [a, b] of template.symmetries ?? []) {
+    skeleton.addSymmetry(template.nodes[a], template.nodes[b]);
+  }
+
+  // Update this skeleton's instance points to match the new node count
+  for (const lf of labels.labeledFrames) {
+    for (const inst of lf.instances) {
+      if (!instanceUsesSkeleton(labels, inst, skeleton)) continue;
+      inst.points = newNodes.map((node) => ({
+        xy: [NaN, NaN] as [number, number],
+        visible: false,
+        complete: false,
+        name: node.name,
+      }));
+      inst.skeleton = skeleton;
+    }
+  }
+}
+
+/**
+ * Store a skeleton-aware undo entry.
+ *
+ * The standard CommandContext undo system only snapshots instance data per frame.
+ * Skeleton mutations need custom undo that restores both skeleton state and
+ * all instance points.
+ */
+function storeSkeletonUndo(
+  ctx: CommandContext,
+  commandName: string,
+  before: SkeletonSnapshot,
+  _after: SkeletonSnapshot
+) {
+  // We create a custom undo snapshot that, when restored, will also
+  // restore the skeleton state. We piggyback on the allFrames snapshot
+  // mechanism and add skeleton restoration via a monkey-patched approach.
+  //
+  // Since CommandContext.restoreSnapshot doesn't know about skeleton,
+  // we use pushUndoSnapshot with a special snapshot and override the
+  // restore by storing the before state in a WeakMap.
+  const snapshot = ctx.takeAllFramesSnapshot(commandName);
+
+  // Store skeleton state in the snapshot via the tracks field (hacky but works
+  // without modifying CommandContext). We'll restore skeleton on undo by
+  // registering a one-time listener.
+  //
+  // Better approach: store the before skeleton snapshot and register a
+  // listener that runs on next undo to also restore skeleton.
+
+  // Store in module-level map
+  skeletonUndoMap.set(snapshot, before);
+
+  ctx.pushUndoSnapshot(snapshot);
+
+  // Register a one-time update listener that intercepts undo
+  const unsub = ctx.onUpdate(() => {
+    // This fires on any command execution; we need to check if it's an undo
+    // that matches our snapshot. Since we can't directly detect that, we
+    // instead just always restore skeleton state when undo happens.
+    // This is handled by the SkeletonPanel via the onUpdate mechanism.
+  });
+
+  // Clean up listener after a short delay — it's only needed for the immediate
+  // next undo operation
+  setTimeout(() => unsub(), 0);
+}
+
+/**
+ * Map from undo snapshots to their corresponding skeleton state.
+ * Used by the skeleton undo interceptor.
+ */
+const skeletonUndoMap = new WeakMap<object, SkeletonSnapshot>();
+
+/**
+ * Install a skeleton-aware undo/redo interceptor on the CommandContext.
+ *
+ * This wraps the undo() and redo() methods to also restore skeleton state
+ * when skeleton-related commands are undone/redone.
+ */
+export function installSkeletonUndoInterceptor(ctx: CommandContext): void {
+  const originalUndo = ctx.undo.bind(ctx);
+  const originalRedo = ctx.redo.bind(ctx);
+
+  // Access the undo/redo stacks via the command context
+  // We need to peek at the top of the stack before undo/redo pops it
+  ctx.undo = function (): boolean {
+    // Peek at the top of the undo stack
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const undoStack = (ctx as any).undoStack as any[];
+    if (!undoStack || undoStack.length === 0) return false;
+
+    const topSnapshot = undoStack[undoStack.length - 1];
+    const skeletonBefore = skeletonUndoMap.get(topSnapshot);
+
+    // Take current skeleton snapshot for redo
+    let currentSkelSnapshot: SkeletonSnapshot | undefined;
+    if (skeletonBefore) {
+      currentSkelSnapshot = takeSkeletonSnapshot(ctx, skeletonBefore.skeleton);
+    }
+
+    const result = originalUndo();
+
+    if (result && skeletonBefore) {
+      restoreSkeletonSnapshot(ctx, skeletonBefore);
+
+      // Store current state for redo
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const redoStack = (ctx as any).redoStack as any[];
+      if (redoStack && redoStack.length > 0 && currentSkelSnapshot) {
+        const redoTop = redoStack[redoStack.length - 1];
+        skeletonUndoMap.set(redoTop, currentSkelSnapshot);
+      }
+    }
+
+    return result;
+  };
+
+  ctx.redo = function (): boolean {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const redoStack = (ctx as any).redoStack as any[];
+    if (!redoStack || redoStack.length === 0) return false;
+
+    const topSnapshot = redoStack[redoStack.length - 1];
+    const skeletonBefore = skeletonUndoMap.get(topSnapshot);
+
+    let currentSkelSnapshot: SkeletonSnapshot | undefined;
+    if (skeletonBefore) {
+      currentSkelSnapshot = takeSkeletonSnapshot(ctx, skeletonBefore.skeleton);
+    }
+
+    const result = originalRedo();
+
+    if (result && skeletonBefore) {
+      restoreSkeletonSnapshot(ctx, skeletonBefore);
+
+      // Store current state for undo
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const undoStack = (ctx as any).undoStack as any[];
+      if (undoStack && undoStack.length > 0 && currentSkelSnapshot) {
+        const undoTop = undoStack[undoStack.length - 1];
+        skeletonUndoMap.set(undoTop, currentSkelSnapshot);
+      }
+    }
+
+    return result;
+  };
+}
+
+/**
+ * Add a symmetry (left/right mirror pair) between two nodes.
+ *
+ * Params: { node1: string, node2: string } (node names)
+ */
+export const AddSymmetryCommand: Command = {
+  name: "AddSymmetry",
+  topics: [UpdateTopic.Skeleton],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { skeleton } = ctx.state;
+    if (!skeleton) return;
+
+    const node1 = params?.node1 as string | undefined;
+    const node2 = params?.node2 as string | undefined;
+    if (!node1 || !node2 || node1 === node2) return;
+
+    // A node can be in at most one symmetry, and pairs are unordered — reject a
+    // duplicate or a node already symmetric to something.
+    const clash = skeleton.symmetries.some((sym) => {
+      const names = new Set([sym.at(0).name, sym.at(1).name]);
+      return names.has(node1) || names.has(node2);
+    });
+    if (clash) return;
+
+    const before = beginSkeletonEdit(ctx);
+    skeleton.addSymmetry(node1, node2);
+    const after = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "AddSymmetry", before, after);
+
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Remove a symmetry pair by its index in `skeleton.symmetries`.
+ *
+ * Params: { symmetryIdx: number }
+ */
+export const RemoveSymmetryCommand: Command = {
+  name: "RemoveSymmetry",
+  topics: [UpdateTopic.Skeleton],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { skeleton } = ctx.state;
+    if (!skeleton) return;
+
+    const idx = params?.symmetryIdx as number | undefined;
+    if (idx == null || idx < 0 || idx >= skeleton.symmetries.length) return;
+
+    const before = beginSkeletonEdit(ctx);
+    skeleton.symmetries.splice(idx, 1);
+    const after = takeSkeletonSnapshot(ctx);
+    storeSkeletonUndo(ctx, "RemoveSymmetry", before, after);
+
+    ctx.state.markChanged();
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Several skeletons per project
+// ---------------------------------------------------------------------------
+
+/**
+ * Add a new, empty skeleton to the project and make it the active one, so the
+ * user can fill it (template, Load From File…, Draw on frame, + Node) and then
+ * label instances of it next to instances of the other skeleton(s).
+ *
+ * Undoable: the standard snapshot restores `labels.skeletons`, and undo/redo
+ * then re-validates the active skeleton (see `reconcileActiveSkeleton`).
+ *
+ * Params: { name: string } — must be non-empty and not used by another skeleton.
+ */
+export const AddSkeletonCommand: Command = {
+  name: "AddSkeleton",
+  topics: [UpdateTopic.Skeleton, UpdateTopic.Labels],
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels } = ctx.state;
+    if (!labels) return;
+    const name = (params?.name as string | undefined)?.trim();
+    if (!name) return;
+    if (labels.skeletons.some((s) => s.name?.trim() === name)) return;
+
+    const skeleton = new Skeleton({ nodes: [], name });
+    labels.skeletons.push(skeleton);
+    dirtyFrameTracker.markStructural();
+    ctx.state.setActiveSkeleton(skeleton);
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Rename a skeleton (the active one by default). Undoable.
+ *
+ * Params: { newName: string, skeleton?: Skeleton }
+ */
+export const RenameSkeletonCommand: Command = {
+  name: "RenameSkeleton",
+  topics: [UpdateTopic.Skeleton],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels } = ctx.state;
+    const skeleton =
+      (params?.skeleton as Skeleton | undefined) ?? ctx.state.skeleton;
+    const newName = (params?.newName as string | undefined)?.trim();
+    if (!labels || !skeleton || !newName || skeleton.name === newName) return;
+    if (labels.skeletons.some((s) => s !== skeleton && s.name?.trim() === newName))
+      return;
+
+    const before = beginSkeletonEdit(ctx, skeleton);
+    skeleton.name = newName;
+    const after = takeSkeletonSnapshot(ctx, skeleton);
+    storeSkeletonUndo(ctx, "RenameSkeleton", before, after);
+
+    dirtyFrameTracker.markStructural();
+    ctx.state.markChanged();
+  },
+};

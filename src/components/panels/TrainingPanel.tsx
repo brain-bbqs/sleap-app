@@ -1,0 +1,2250 @@
+/**
+ * Training panel for configuring and running sleap-nn model training.
+ *
+ * Layout (top to bottom):
+ *  - Configuration sections (all collapsible)
+ *  - Start/Stop/Cancel buttons
+ *  - Progress (when running or done)
+ */
+
+import { useState, useRef, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
+import { useTrainingStore, getConfigSlots, getSlotLabel, countUserLabeledFrames, isBboxModelType, BBOX_REMOTE_UNSUPPORTED } from "@/stores/trainingStore";
+import { useExportStore } from "@/stores/exportStore";
+import type { ModelType, ConfigFile, ConfigHyperparams } from "@/stores/trainingStore";
+import { useConnectStore } from "@/stores/connectStore";
+import { BackendPicker } from "@/components/common/BackendPicker";
+import { RemoteFileBrowser } from "@/components/dialogs/RemoteFileBrowser";
+import { TrainingConfigDialog } from "@/components/dialogs/TrainingConfigDialog";
+import { arborescenceMessage, arborescenceProblems, hasTrackedUserInstances, ID_NO_TRACKS_MESSAGE } from "@/lib/trainingChecks";
+import { RemoteDataSummary } from "@/components/connect/RemoteDataSummary";
+import { RemoteOutputFolder } from "@/components/connect/RemoteOutputFolder";
+import { HiddenVideosDialog } from "@/components/connect/HiddenVideosDialog";
+import { RemoteRunCard } from "@/components/connect/RemoteRunCard";
+import { LossViewerDialog } from "@/components/monitors/LossViewerDialog";
+import { LogTerminalDialog } from "@/components/monitors/LogTerminalDialog";
+import { ErrorOutput } from "@/components/monitors/ErrorOutput";
+import { DryRunResult } from "@/components/panels/DryRunResult";
+import { BboxTrainingFields } from "@/components/panels/BboxTrainingFields";
+import { useAppStore } from "@/stores/appStore";
+import { isTauri } from "@/platform/index";
+import { getBaselineProfilesForHead, slotToHeadType } from "@/lib/trainingProfiles";
+import { computeInstanceSizeStats, hasUserLabeledInstances, recommendBackboneProfile, recommendCentroidScale, resolveEffectiveCropSize, detectVideoChannels, estimateHeadGpuMemory, estimateHeadCacheMemory, formatBytes, formatParamCount, type GpuMemoryLevel } from "@/lib/modelStats";
+import type { DiscoveredModel } from "@/lib/modelDiscovery";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { NumberInput } from "@/components/NumberInput";
+import { Separator } from "@/components/ui/separator";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Ban,
+  AlertCircle,
+  AlertTriangle,
+  Upload,
+  X,
+  ChevronDown,
+  ChevronRight,
+  ExternalLink,
+  FlaskConical,
+  Folder,
+  Square,
+  Settings2,
+  LineChart,
+  BarChart3,
+  Copy,
+  Maximize2,
+  Crosshair,
+  HelpCircle,
+  Eye,
+  EyeOff,
+  Download,
+  Lightbulb,
+} from "lucide-react";
+import { computeNodeVisibility, visibilityTier } from "@/lib/anchorVisibility";
+import { TUTORIAL_FIRST_TRAINING_STEP_IDS } from "@/lib/tutorial/steps";
+import { projectTag } from "@/lib/projectTag";
+import { formatDuration } from "@/lib/timestamp";
+import { classifyVisibility, type VideoVisibility } from "@/lib/remoteVisibility";
+import { SingleSkeletonGate } from "./SingleSkeletonGate";
+import { POST_TRAINING_TARGET_OPTIONS, describeClip } from "@/lib/postTrainingTarget";
+import { headTypeMatches } from "@/lib/bboxModels";
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const MODEL_TYPE_OPTIONS: { value: ModelType; label: string }[] = [
+  { value: "single_animal", label: "Single Animal" },
+  { value: "top_down", label: "Top-Down" },
+  { value: "bottom_up", label: "Bottom-Up" },
+  { value: "top_down_id", label: "Top-Down + ID" },
+  { value: "bottom_up_id", label: "Bottom-Up + ID" },
+  { value: "bbox", label: "Box Detector" },
+  { value: "top_down_bbox", label: "Top-Down (Box Crops)" },
+];
+
+const GPU_MEMORY_LEVEL_COLOR: Record<GpuMemoryLevel, string> = {
+  ok: "text-green-400",
+  warning: "text-yellow-400",
+  danger: "text-destructive",
+};
+
+// ── Skeleton ↔ Pipeline Compatibility & Recommendation ───────────────────────
+
+interface SkeletonCompatibility {
+  disabledTypes: Set<ModelType>;
+  warnings: Map<ModelType, string>;
+}
+
+interface PipelineRecommendation {
+  recommended: ModelType;
+  reason: string;
+  alternatives: ModelType[];
+}
+
+const BOTTOM_UP_TYPES: ModelType[] = ["bottom_up", "bottom_up_id"];
+
+async function openExternal(url: string) {
+  if (isTauri) {
+    const { open } = await import("@tauri-apps/plugin-shell");
+    await open(url);
+  } else {
+    window.open(url, "_blank");
+  }
+}
+
+function isSkeletonConnected(
+  nodes: { name: string }[],
+  edges: { source: { name: string }; destination: { name: string } }[],
+): boolean {
+  if (nodes.length <= 1) return true;
+  if (edges.length === 0) return false;
+  const adj = new Map<string, Set<string>>();
+  for (const n of nodes) adj.set(n.name, new Set());
+  for (const e of edges) {
+    adj.get(e.source.name)?.add(e.destination.name);
+    adj.get(e.destination.name)?.add(e.source.name);
+  }
+  const visited = new Set<string>();
+  const queue = [nodes[0].name];
+  visited.add(nodes[0].name);
+  while (queue.length > 0) {
+    const curr = queue.pop()!;
+    for (const neighbor of adj.get(curr) ?? []) {
+      if (!visited.has(neighbor)) {
+        visited.add(neighbor);
+        queue.push(neighbor);
+      }
+    }
+  }
+  return visited.size === nodes.length;
+}
+
+function getSkeletonCompatibility(
+  skeleton: { nodes: { name: string }[]; edges: { source: { name: string }; destination: { name: string } }[] } | null,
+): SkeletonCompatibility {
+  const disabledTypes = new Set<ModelType>();
+  const warnings = new Map<ModelType, string>();
+
+  if (!skeleton) return { disabledTypes, warnings };
+
+  if (skeleton.edges.length === 0) {
+    for (const t of BOTTOM_UP_TYPES) disabledTypes.add(t);
+  } else if (!isSkeletonConnected(skeleton.nodes, skeleton.edges)) {
+    for (const t of BOTTOM_UP_TYPES) {
+      warnings.set(t, "Bottom-Up works best with a fully connected skeleton");
+    }
+  }
+
+  return { disabledTypes, warnings };
+}
+
+export type LabelsLike = {
+  labeledFrames: Array<{
+    /** Identity-compared against `videos` to scope suggestions to labeled videos. */
+    video?: unknown;
+    userInstances: Array<{
+      points: Array<{ xy: [number, number]; visible: boolean }>;
+    }>;
+  }>;
+  videos: Array<{ shape: [number, number, number, number] | null }>;
+  skeletons: Array<{ edges: { source: { name: string }; destination: { name: string } }[] }>;
+  tracks: unknown[];
+};
+
+/**
+ * Suggest a pipeline from the project's GROUND TRUTH.
+ *
+ * Returns null when there is nothing to go on, which the caller treats as "no
+ * suggestion" (keep the current model type, warn the user) rather than
+ * inventing one. `labels.labeledFrames.length > 0` is NOT enough to go on: a
+ * `labels_pr.*.slp` written by inference has one frame per PREDICTED frame and
+ * zero user instances, so every count below comes out 0 — and 0 instances then
+ * fell through the `maxInstances <= 1` branch and reported "Only one animal per
+ * frame" on a two-animal project. Absence of ground truth is not evidence of a
+ * single animal, so require at least one user instance.
+ */
+export function recommendPipeline(labels: LabelsLike | null): PipelineRecommendation | null {
+  if (!labels || labels.labeledFrames.length === 0) return null;
+
+  let maxInstances = 0;
+  let bboxSum = 0;
+  let bboxCount = 0;
+  let maxPointCoord = 0;
+
+  for (const lf of labels.labeledFrames) {
+    const userInsts = lf.userInstances;
+    if (userInsts.length > maxInstances) maxInstances = userInsts.length;
+
+    for (const inst of userInsts) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      let validCount = 0;
+      for (const pt of inst.points) {
+        if (pt.visible && !Number.isNaN(pt.xy[0]) && !Number.isNaN(pt.xy[1])) {
+          if (pt.xy[0] < minX) minX = pt.xy[0];
+          if (pt.xy[1] < minY) minY = pt.xy[1];
+          if (pt.xy[0] > maxX) maxX = pt.xy[0];
+          if (pt.xy[1] > maxY) maxY = pt.xy[1];
+          if (pt.xy[0] > maxPointCoord) maxPointCoord = pt.xy[0];
+          if (pt.xy[1] > maxPointCoord) maxPointCoord = pt.xy[1];
+          validCount++;
+        }
+      }
+      if (validCount >= 2) {
+        bboxSum += Math.max(maxX - minX, maxY - minY);
+        bboxCount++;
+      }
+    }
+  }
+
+  // No user-labeled instance anywhere: nothing to suggest from (see above).
+  if (maxInstances === 0) return null;
+
+  const avgBbox = bboxCount > 0 ? bboxSum / bboxCount : 0;
+  // Frame size from the user-labeled videos only — the animal-size ratio below
+  // is meaningless against a video that was never labeled (mirrors
+  // videosWithUserLabels in modelStats.ts).
+  const labeledVideos = new Set<unknown>();
+  for (const lf of labels.labeledFrames) {
+    if (lf.userInstances.length > 0) labeledVideos.add(lf.video);
+  }
+  let maxDim = 0;
+  for (const v of labels.videos) {
+    if (labeledVideos.size > 0 && !labeledVideos.has(v)) continue;
+    if (v.shape) {
+      const d = Math.max(v.shape[1], v.shape[2]);
+      if (d > maxDim) maxDim = d;
+    }
+  }
+  if (maxDim === 0 && maxPointCoord > 0) {
+    maxDim = maxPointCoord;
+  }
+
+  const ratio = maxDim > 0 ? avgBbox / maxDim : 0;
+  const numEdges = labels.skeletons[0]?.edges.length ?? 0;
+  const hasTracks = labels.tracks.length > 1;
+
+  if (maxInstances <= 1) {
+    return {
+      recommended: "single_animal",
+      reason: "Only one animal per frame",
+      alternatives: ["top_down"],
+    };
+  }
+
+  if (ratio < 0.20) {
+    const alts: ModelType[] = ["bottom_up"];
+    if (hasTracks) alts.push("top_down_id");
+    return {
+      recommended: "top_down",
+      reason: `Animals are small (~${Math.round(ratio * 100)}% of frame) — top-down recommended`,
+      alternatives: alts,
+    };
+  }
+
+  if (numEdges === 0) {
+    const alts: ModelType[] = [];
+    if (hasTracks) alts.push("top_down_id");
+    return {
+      recommended: "top_down",
+      reason: "No skeleton edges — bottom-up requires edges for Part Affinity Fields",
+      alternatives: alts,
+    };
+  }
+
+  const alts: ModelType[] = ["top_down"];
+  if (hasTracks) alts.push("bottom_up_id");
+  return {
+    recommended: "bottom_up",
+    reason: `Larger animals (~${Math.round(ratio * 100)}% of frame) — bottom-up handles occlusions well`,
+    alternatives: alts,
+  };
+}
+
+// ── Reusable widgets ─────────────────────────────────────────────────────────
+
+function Section({
+  title,
+  defaultOpen = false,
+  children,
+}: {
+  title: string;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div>
+      <button
+        className="flex items-center gap-1 w-full text-left py-1"
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? (
+          <ChevronDown className="h-3 w-3 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-3 w-3 text-muted-foreground" />
+        )}
+        <span className="text-xs font-medium">{title}</span>
+      </button>
+      {open && <div className="pl-4 space-y-2 pb-1">{children}</div>}
+    </div>
+  );
+}
+
+// ── Config upload slot ───────────────────────────────────────────────────────
+
+/** True if `checkpointPath` lives inside `runPath` (either / or \ separator, and not equal to it). */
+function checkpointBelongsToRun(checkpointPath: string, runPath: string): boolean {
+  return checkpointPath.startsWith(`${runPath}/`) || checkpointPath.startsWith(`${runPath}\\`);
+}
+
+function ConfigSlot({
+  slot,
+  modelType,
+  configFile,
+  discoveredModels,
+  onAdd,
+  onRemove,
+  disabled,
+}: {
+  slot: string;
+  modelType: ModelType;
+  configFile: ConfigFile | undefined;
+  discoveredModels: DiscoveredModel[];
+  onAdd: (slot: string) => void;
+  onRemove: (slot: string) => void;
+  disabled: boolean;
+}) {
+  const [dragOver, setDragOver] = useState(false);
+  const { parseYamlConfig, addConfigFile } = useTrainingStore();
+
+  const headType = slotToHeadType(modelType, slot);
+  const baselineProfiles = getBaselineProfilesForHead(headType);
+  const forThisHead = discoveredModels.filter((m) => headTypeMatches(headType, m));
+
+  // Which dropdown item the current configFile actually corresponds to — a
+  // discovered run is identified by its checkpoint living inside that run's
+  // directory (every parsed run config shares the same literal filename,
+  // "training_config.yaml", so the filename alone can't tell runs apart).
+  const matchingRun = configFile?.checkpointPath
+    ? forThisHead.find((run) => checkpointBelongsToRun(configFile.checkpointPath!, run.path))
+    : undefined;
+  const selectValue = !configFile ? "" : matchingRun ? matchingRun.path : configFile.filename;
+
+  const handleFile = (file: File) => {
+    if (!file.name.endsWith(".yaml") && !file.name.endsWith(".yml")) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = reader.result as string;
+      const parsed = parseYamlConfig(text, file.name, slot);
+      if (parsed) {
+        addConfigFile(parsed);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleSelectRun = async (run: DiscoveredModel) => {
+    try {
+      const { join } = await import("@tauri-apps/api/path");
+      const { readTextFile } = await import("@tauri-apps/plugin-fs");
+      const yamlText = await readTextFile(await join(run.path, "training_config.yaml"));
+      const checkpointPath = run.checkpointFile ? await join(run.path, run.checkpointFile) : null;
+      const parsed = parseYamlConfig(yamlText, "training_config.yaml", slot, checkpointPath);
+      if (parsed) addConfigFile(parsed);
+    } catch {
+      // Unreadable/missing despite discovery — leave the current config as-is.
+    }
+  };
+
+  return (
+    <div
+      className={`rounded-md border p-2 transition-colors ${
+        configFile
+          ? "border-green-500/50 bg-green-500/5"
+          : `border-dashed ${dragOver ? "border-primary bg-primary/5" : "border-border hover:border-primary/50"}`
+      }`}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const file = e.dataTransfer.files[0];
+        if (file) handleFile(file);
+      }}
+    >
+      <div className="flex items-center gap-1">
+        <Select
+          value={selectValue}
+          onValueChange={(v) => {
+            if (v === "__browse__") {
+              onAdd(slot);
+              return;
+            }
+            const baseline = baselineProfiles.find((p) => p.filename === v);
+            if (baseline) {
+              const parsed = parseYamlConfig(baseline.content, baseline.filename, slot);
+              if (parsed) addConfigFile(parsed);
+              return;
+            }
+            const run = forThisHead.find((m) => m.path === v);
+            if (run) handleSelectRun(run);
+          }}
+          disabled={disabled}
+        >
+          <SelectTrigger className="h-8 text-xs flex-1 min-w-0">
+            <SelectValue placeholder="Select training config file..." />
+          </SelectTrigger>
+          <SelectContent>
+            {baselineProfiles.map((p) => (
+              <SelectItem key={p.filename} value={p.filename}>
+                {p.label}
+              </SelectItem>
+            ))}
+            {forThisHead.map((run) => (
+              <SelectItem key={run.path} value={run.path}>
+                [Trained] {run.runName ?? run.path} (training_config.yaml)
+              </SelectItem>
+            ))}
+            {configFile && !matchingRun && !baselineProfiles.some((p) => p.filename === configFile.filename) && (
+              <SelectItem value={configFile.filename}>{configFile.filename}</SelectItem>
+            )}
+            <SelectItem value="__browse__" className="text-primary font-medium">
+              Browse for config file...
+            </SelectItem>
+          </SelectContent>
+        </Select>
+        {configFile && (
+          <button
+            className="text-muted-foreground hover:text-destructive shrink-0"
+            onClick={() => onRemove(slot)}
+            disabled={disabled}
+          >
+            <X className="h-3 w-3" />
+          </button>
+        )}
+      </div>
+      {configFile ? (
+        <div className="text-[10px] text-muted-foreground font-mono mt-1">
+          head: {configFile.modelType}
+        </div>
+      ) : (
+        <div className="text-[10px] text-muted-foreground mt-1 text-center">
+          or drop a YAML config here
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Per-config field groups ──────────────────────────────────────────────────
+
+/** Tailwind text color per visibility tier, matching this panel's log coloring. */
+const VISIBILITY_COLOR: Record<ReturnType<typeof visibilityTier>, string> = {
+  high: "text-green-400",
+  medium: "text-yellow-400",
+  low: "text-destructive",
+};
+
+/**
+ * Hover-help icon with a floating tooltip, portaled to `document.body`.
+ * A plain `title` attribute doesn't reliably render in the Tauri desktop
+ * WebView, so this mirrors TrainingConfigDialog's working `HintBubble`
+ * instead of relying on the native tooltip.
+ */
+function HelpTooltip({ text }: { text: string }) {
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  return (
+    <span
+      className="cursor-help"
+      onMouseEnter={(e) => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        setPos({ x: rect.left + rect.width / 2, y: rect.top });
+      }}
+      onMouseLeave={() => setPos(null)}
+    >
+      <HelpCircle className="h-3 w-3 text-muted-foreground/50 hover:text-muted-foreground" />
+      {pos && createPortal(
+        <span
+          className="fixed z-[9999] px-2.5 py-1.5 text-[10px] bg-popover border rounded-md shadow-lg w-56 text-foreground leading-relaxed"
+          style={{ left: pos.x, top: pos.y - 6, transform: "translate(-50%, -100%)" }}
+        >
+          {text}
+        </span>,
+        document.body,
+      )}
+    </span>
+  );
+}
+
+/**
+ * Anchor-part picker, shared across the top-down pipeline's centroid /
+ * centered-instance split — it's one concept (where to crop around each
+ * animal), not a per-head setting, so it lives above that tab division
+ * instead of duplicated inside one head's tab.
+ */
+function AnchorPartField({
+  hp,
+  onUpdate,
+  disabled,
+}: {
+  hp: ConfigHyperparams;
+  onUpdate: (updates: Partial<ConfigHyperparams>) => void;
+  disabled: boolean;
+}) {
+  const labels = useAppStore((s) => s.labels);
+  const skeleton = useAppStore((s) => s.skeleton);
+  const overlayVersion = useAppStore((s) => s.overlayVersion);
+  const pickedAnchorNode = useAppStore((s) => s.pickedAnchorNode);
+  const [myPickRequestId, setMyPickRequestId] = useState<number | null>(null);
+  const [previewOn, setPreviewOn] = useState(false);
+
+  const nodeVisibility = useMemo(
+    () => computeNodeVisibility(labels, skeleton),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [labels, skeleton, overlayVersion]
+  );
+  const hasLabeledData = [...nodeVisibility.values()].some((v) => v.total > 0);
+
+  // Apply a canvas pick once it resolves — but only the one THIS field asked
+  // for (myPickRequestId), so a stale/superseded request can't misapply.
+  useEffect(() => {
+    if (myPickRequestId == null || !pickedAnchorNode) return;
+    if (pickedAnchorNode.requestId !== myPickRequestId) return;
+    onUpdate({ anchorPart: pickedAnchorNode.nodeName });
+    setMyPickRequestId(null);
+    useAppStore.getState().clearPickedAnchorNode();
+  }, [pickedAnchorNode, myPickRequestId, onUpdate]);
+
+  // The real crop size this head will actually use (manual override, or the
+  // augmentation-padded Auto value) — shared with ModelStatsPreview's
+  // diagram via resolveEffectiveCropSize so both viewers always agree.
+  const effectiveCropSize = useMemo(
+    () => resolveEffectiveCropSize(labels, hp).cropSize,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [labels, hp.cropSize, hp.maxStride, hp.scale, hp.rotationPreset, hp.rotationCustomAngle, hp.scaleEnabled, hp.scaleMax],
+  );
+
+  // Keep the on-canvas crop preview in sync with the current selection while
+  // the toggle is on; drop it the moment it's toggled off.
+  useEffect(() => {
+    if (previewOn) {
+      useAppStore.getState().setAnchorPreview(hp.anchorPart, effectiveCropSize);
+    } else {
+      useAppStore.getState().clearAnchorPreview();
+    }
+  }, [previewOn, hp.anchorPart, effectiveCropSize]);
+
+  // Safety net: never leave the preview dangling with no way to turn it off
+  // if this field disappears entirely (e.g. pipeline switched away from
+  // top-down) while the toggle was on.
+  useEffect(() => {
+    return () => {
+      useAppStore.getState().clearAnchorPreview();
+    };
+  }, []);
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-1">
+        <span className="text-[10px] text-muted-foreground">Anchor Part</span>
+        <HelpTooltip text="The % next to each node is how often it's visible across labeled instances in this project — pick one that's reliably visible and central on the animal for the best crop." />
+      </div>
+      <div className="flex items-center gap-1">
+        <Select
+          value={hp.anchorPart ?? "__auto__"}
+          onValueChange={(v) => onUpdate({ anchorPart: v === "__auto__" ? null : v })}
+          disabled={disabled}
+        >
+          <SelectTrigger className="h-7 text-xs flex-1" data-tutorial="anchor-part-select"><SelectValue placeholder="Auto" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__auto__">Auto (bbox center)</SelectItem>
+            {skeleton?.nodes.map((n) => {
+              const vis = nodeVisibility.get(n.name);
+              return (
+                <SelectItem key={n.name} value={n.name}>
+                  <span className="flex items-center gap-1.5">
+                    {n.name}
+                    {vis && vis.total > 0 && (
+                      <span className={`text-[10px] ${VISIBILITY_COLOR[visibilityTier(vis.pct)]}`}>
+                        {vis.pct}%
+                      </span>
+                    )}
+                  </span>
+                </SelectItem>
+              );
+            })}
+          </SelectContent>
+        </Select>
+        <button
+          className="shrink-0 h-7 w-7 flex items-center justify-center rounded border border-border text-muted-foreground hover:text-foreground hover:border-primary/50 disabled:opacity-40 disabled:hover:text-muted-foreground disabled:hover:border-border"
+          disabled={disabled || !hasLabeledData}
+          title={
+            hasLabeledData
+              ? "Pick anchor from canvas"
+              : "No labeled frames in this project yet"
+          }
+          onClick={() => setMyPickRequestId(useAppStore.getState().startAnchorPick())}
+        >
+          <Crosshair className="h-3.5 w-3.5" />
+        </button>
+        <button
+          className={`shrink-0 h-7 w-7 flex items-center justify-center rounded border disabled:opacity-40 ${
+            previewOn
+              ? "border-primary/50 text-primary bg-primary/10"
+              : "border-border text-muted-foreground hover:text-foreground hover:border-primary/50"
+          }`}
+          disabled={disabled}
+          title={previewOn ? "Hide crop preview" : "Preview crop on canvas"}
+          onClick={() => setPreviewOn((v) => !v)}
+        >
+          {previewOn ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function HyperparamsFields({
+  slot,
+  hp,
+  onUpdate,
+  disabled,
+}: {
+  slot: string;
+  hp: ConfigHyperparams;
+  onUpdate: (slot: string, updates: Partial<ConfigHyperparams>) => void;
+  disabled: boolean;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] text-muted-foreground shrink-0 flex items-center gap-1">
+          Max Epochs
+          <HelpTooltip text="Maximum number of epochs to train for. Training can be stopped manually or automatically if early stopping is enabled and a plateau is detected." />
+        </span>
+        <NumberInput min={1} max={1000} integer
+          value={hp.maxEpochs}
+          onCommit={(n) => onUpdate(slot, { maxEpochs: n })}
+
+          className="h-6 text-[10px] w-20"
+          disabled={disabled}
+        />
+      </div>
+
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] text-muted-foreground shrink-0 flex items-center gap-1">
+          Batch Size
+          <HelpTooltip text="Number of examples per minibatch. Higher numbers can increase generalization by averaging gradient updates over more examples, at the cost of more GPU memory. Lower numbers may lead to overfitting but can help optimization with few varied examples." />
+        </span>
+        <NumberInput min={1} max={512} integer
+          value={hp.batchSize}
+          onCommit={(n) => onUpdate(slot, { batchSize: n })}
+
+
+          className="h-6 text-[10px] w-20"
+          disabled={disabled}
+        />
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <div className="space-y-1">
+          <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+            Rotation Augmentation
+            <HelpTooltip text="Rotation augmentation range. Off: disabled. ±15°: for side-view cameras where upside-down would be unnatural. ±180°: for top-view/overhead cameras where all orientations are valid." />
+          </span>
+          <Select
+            value={hp.rotationPreset}
+            onValueChange={(v) => onUpdate(slot, { rotationPreset: v as "off" | "15" | "180" | "custom" })}
+            disabled={disabled}
+          >
+            <SelectTrigger className="h-7 text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="off">Off</SelectItem>
+              <SelectItem value="15">&plusmn;15&deg;</SelectItem>
+              <SelectItem value="180">&plusmn;180&deg;</SelectItem>
+              <SelectItem value="custom">Custom</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1">
+          <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+            Scale Augmentation
+            <HelpTooltip text="Enable random scaling augmentation. Scaling is applied independently with 100% probability when enabled." />
+          </span>
+          <label className="flex items-center gap-1.5 h-7 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={hp.scaleEnabled}
+              onChange={(e) => onUpdate(slot, { scaleEnabled: e.target.checked })}
+              disabled={disabled}
+              className="accent-primary"
+            />
+            <span className="text-[10px] text-muted-foreground">{hp.scaleEnabled ? "On" : "Off"}</span>
+          </label>
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
+
+// ── Panel ────────────────────────────────────────────────────────────────────
+
+/** Gated: needs a single-skeleton project (see SingleSkeletonGate). */
+export function TrainingPanel() {
+  // A job that's running (or finished and showing results) stays visible.
+  const busy = useTrainingStore(
+    (s) => s.status !== "idle" || s.dryRun?.status === "running"
+  );
+  return (
+    <SingleSkeletonGate feature="Training" configRequest="training" busy={busy}>
+      <TrainingPanelContent />
+    </SingleSkeletonGate>
+  );
+}
+
+function TrainingPanelContent() {
+  const config = useTrainingStore((s) => s.config);
+  const status = useTrainingStore((s) => s.status);
+  const _isRemote = useTrainingStore((s) => s._isRemote);
+  const error = useTrainingStore((s) => s.error);
+  const stderrTail = useTrainingStore((s) => s.stderrTail);
+  const startedAt = useTrainingStore((s) => s.startedAt);
+  const models = useTrainingStore((s) => s.models);
+  const currentModelIndex = useTrainingStore((s) => s.currentModelIndex);
+  const wandbUrl = useTrainingStore((s) => s.wandbUrl);
+  const modelOutputDirs = useTrainingStore((s) => s.modelOutputDirs);
+  const postTrainingInference = useTrainingStore((s) => s.postTrainingInference);
+  // Training is over once post-training inference runs: Stop Early has
+  // nothing to stop (it would just end the inference job), so only Cancel.
+  const inferenceRunning = postTrainingInference?.status === "running";
+  const fetchAndLoadPostTrainingPredictions = useTrainingStore((s) => s.fetchAndLoadPostTrainingPredictions);
+  const [fetchingPredictions, setFetchingPredictions] = useState(false);
+  const openExport = useExportStore((s) => s.openExport);
+  const log = useTrainingStore((s) => s.log);
+  // Memoize the rendered log lines so we only re-map when `log` actually changes,
+  // not on every panel render (the log can update frequently during training).
+  const logLines = useMemo(
+    () =>
+      log.map((line, j) => (
+        <div
+          key={j}
+          className={
+            line.includes("*** best ***")
+              ? "text-green-400"
+              : line.includes("Error") || line.includes("error")
+                ? "text-destructive"
+                : line.startsWith("—")
+                  ? "text-yellow-400"
+                  : ""
+          }
+        >
+          {line}
+        </div>
+      )),
+    [log],
+  );
+  const setConfig = useTrainingStore((s) => s.setConfig);
+  const updateConfigHyperparams = useTrainingStore((s) => s.updateConfigHyperparams);
+  const removeConfigFile = useTrainingStore((s) => s.removeConfigFile);
+  const startTraining = useTrainingStore((s) => s.startTraining);
+  const stopTraining = useTrainingStore((s) => s.stopTraining);
+  const cancelTraining = useTrainingStore((s) => s.cancelTraining);
+  const dryRun = useTrainingStore((s) => s.dryRun);
+  const startDryRun = useTrainingStore((s) => s.startDryRun);
+  const dryRunning = dryRun?.status === "running";
+  const reset = useTrainingStore((s) => s.reset);
+  const resetSeq = useTrainingStore((s) => s.resetSeq);
+  const { parseYamlConfig: parseConfig, addConfigFile: addConfig } = useTrainingStore();
+  const [discoveredModels, setDiscoveredModels] = useState<DiscoveredModel[]>([]);
+  const projectPath = useAppStore((s) => s.projectPath);
+  const filename = useAppStore((s) => s.filename);
+  const tutorialActive = useAppStore((s) => s.tutorialActive);
+  const tutorialSteps = useAppStore((s) => s.tutorialSteps);
+  const tutorialStepIndex = useAppStore((s) => s.tutorialStepIndex);
+
+  // Auto-load a config when a slot has none: prefer the EXACT config from that
+  // head's most recently trained run under `{projectDir}/models/` (same
+  // discovery — findTrainedModels — InferencePanel uses to auto-pick a model),
+  // so "Train Again" resumes from what was actually run last time rather than
+  // a generic baseline; falls back to the baseline profile when there's no
+  // trained run for that head (fresh project, or browser/no local project dir).
+  // EXCEPT during the tutorial's first training pass
+  // (`TUTORIAL_FIRST_TRAINING_STEP_IDS`) — that pass is meant to demonstrate
+  // the baseline workflow, so it always loads the baseline even if a trained
+  // run already exists on disk for this head (e.g. a prior tutorial pass on
+  // the same project); the tutorial's later `retrain` step goes through this
+  // same effect again (via `resetSeq`) with trained-config preference back on,
+  // picking up the run that first pass just produced.
+  // Clears stale configs from the previous model type first. Also re-runs on
+  // `resetSeq` (bumped by every `reset()`, e.g. "Train Again"): a reset landing
+  // back on the SAME model type wouldn't otherwise re-trigger this effect (its
+  // other dependency, config.modelType, hasn't changed), so config.configs —
+  // wiped to [] by reset() — would stay empty forever.
+  const prevModelType = useRef(config.modelType);
+  useEffect(() => {
+    const newSlots = getConfigSlots(config.modelType);
+    const dropped = new Set<string>();
+    if (prevModelType.current !== config.modelType) {
+      // Remove configs that don't belong to the new model type's slots
+      for (const cf of config.configs) {
+        // Also drop a config whose slot now wants a different kind of head:
+        // Top-Down's fixed-crop centered-instance config doesn't carry over to
+        // Top-Down (Box Crops), which loads its box-crop preset instead.
+        if (
+          !newSlots.includes(cf.slot) ||
+          slotToHeadType(prevModelType.current, cf.slot) !== slotToHeadType(config.modelType, cf.slot)
+        ) {
+          removeConfigFile(cf.slot);
+          dropped.add(cf.slot);
+        }
+      }
+      prevModelType.current = config.modelType;
+    }
+    const missingSlots = newSlots.filter(
+      (slot) => dropped.has(slot) || !config.configs.some((c) => c.slot === slot),
+    );
+
+    const currentTutorialStepId = tutorialActive
+      ? tutorialSteps[tutorialStepIndex]?.id
+      : undefined;
+    const preferTrained = !(
+      currentTutorialStepId && TUTORIAL_FIRST_TRAINING_STEP_IDS.has(currentTutorialStepId)
+    );
+
+    let cancelled = false;
+    (async () => {
+      const { resolveSlotConfigSource } = await import("@/lib/trainedConfigAutoload");
+      let discovered: DiscoveredModel[] = [];
+      // No trained-model lookup possible without a local project dir (browser
+      // mode / no project yet) — `discovered` stays empty and every slot below
+      // just falls back to its baseline, same as before this feature existed.
+      let fsAccess: import("@/lib/trainedConfigAutoload").TrainedConfigFsAccess = {
+        readTextFile: async () => {
+          throw new Error("no local project — trained-config lookup unavailable");
+        },
+        join: async () => {
+          throw new Error("no local project — trained-config lookup unavailable");
+        },
+      };
+      if (preferTrained && isTauri && projectPath) {
+        try {
+          const [{ findTrainedModels }, { dirname, join }, { readTextFile }] =
+            await Promise.all([
+              import("@/lib/modelDiscovery"),
+              import("@tauri-apps/api/path"),
+              import("@tauri-apps/plugin-fs"),
+            ]);
+          const projectDir = await dirname(projectPath);
+          discovered = await findTrainedModels(projectDir);
+          fsAccess = { readTextFile, join };
+        } catch {
+          discovered = [];
+        }
+      }
+      if (cancelled) return;
+      // Kept in state (not just this closure) so the per-slot config
+      // dropdown can list every discovered run for a head, not just
+      // whichever one this effect happened to auto-load.
+      setDiscoveredModels(discovered);
+
+      if (missingSlots.length === 0) return;
+
+      // Size-derived Medium/Large RF recommendation for any slot that falls
+      // back to a baseline profile below (no trained run yet for that head).
+      const sizeStats = computeInstanceSizeStats(labels);
+      const backboneRecommendation = sizeStats
+        ? recommendBackboneProfile(sizeStats.maxBboxDim, sizeStats.maxFrameDim)
+        : null;
+      // recommendCentroidScale handles a null avgBboxDim itself (e.g. a
+      // single-keypoint skeleton has no bounding box to measure) by
+      // defaulting to the standard 0.5 — always call it, don't gate on
+      // sizeStats.
+      const centroidScaleRecommendation = recommendCentroidScale(
+        sizeStats?.avgBboxDim ?? null,
+        sizeStats?.maxFrameDim ?? 0,
+      );
+      const detectedVideoChannels = detectVideoChannels(labels);
+
+      for (const slot of missingSlots) {
+        const source = await resolveSlotConfigSource(
+          slot,
+          config.modelType,
+          discovered,
+          fsAccess,
+          { preferTrained, recommendation: backboneRecommendation },
+        );
+        if (cancelled) return;
+        if (source) {
+          const parsed = parseConfig(source.yamlText, source.filename, slot, source.checkpointPath);
+          if (parsed) {
+            // Fresh baseline configs keep the preset's fixed max_stride, as in
+            // SLEAP (Auto is opt-in; see recommendMaxStride in modelStats.ts).
+            // The centroid head's input scale starts from the size-derived
+            // recommendation instead of the baseline's static 0.5, for a
+            // small-in-frame animal (see recommendCentroidScale in modelStats.ts).
+            const hyperparams = { ...parsed.hyperparams };
+            if (source.source === "baseline") {
+              if (slot === "centroid" && centroidScaleRecommendation) {
+                hyperparams.scale = centroidScaleRecommendation.scale;
+              }
+              // Detect the project's actual video channels so a fresh config
+              // starts as RGB when the source video is RGB, instead of
+              // silently relying on "auto" passthrough (see
+              // resolveInputChannels in modelStats.ts).
+              if (detectedVideoChannels === 3) {
+                hyperparams.colorMode = "rgb";
+              }
+            }
+            addConfig({ ...parsed, hyperparams });
+          }
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [config.modelType, resetSeq]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Config dialog state
+  const [configDialogOpen, setConfigDialogOpen] = useState(false);
+
+  // Loss viewer modal: which model's curves are open (null = closed).
+  const [viewerIndex, setViewerIndex] = useState<number | null>(null);
+  const [logDialogOpen, setLogDialogOpen] = useState(false);
+  // Remote runs start as a compact RemoteRunCard, not the live inline monitor
+  // (§3b.4) — "Watch Live" flips this; reset to compact at the start of every
+  // new remote run (not just mount) so a prior "Watch Live" choice doesn't
+  // carry over into the next one.
+  const [watching, setWatching] = useState(false);
+  useEffect(() => {
+    if (_isRemote) setWatching(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [startedAt]);
+
+  // Remote state
+  const [remoteEnabled, setRemoteEnabled] = useState(!isTauri);
+  // Default "this window" (unsaved edits included) — the worker-file picker
+  // (pre-PR3's only option) stays as the alternative. See remoteVisibility.ts
+  // / remoteLabelsPayload.ts for how "window" gets turned into a payload.
+  const [labelsSource, setLabelsSource] = useState<"window" | "worker-file">("window");
+  const [remoteLabelsPath, setRemoteLabelsPath] = useState("");
+  const [remoteValLabelsPath, setRemoteValLabelsPath] = useState("");
+  // Latest visibility check from RemoteDataSummary, lifted here so Start (and
+  // the pre-submit hidden-videos dialog) can use it without recomputing.
+  const [visibility, setVisibility] = useState<VideoVisibility[] | null>(null);
+  // "This window" runs: the worker folder for models + predictions (RemoteOutputFolder).
+  const [remoteOutputDir, setRemoteOutputDir] = useState<string | null>(null);
+  const [hiddenDialogOpen, setHiddenDialogOpen] = useState(false);
+  const [inferenceTarget, setInferenceTarget] = useState<string>("suggestions");
+  const clipDescription = describeClip(useAppStore((s) => s.frameRange));
+  const [sampleCount, setSampleCount] = useState(20);
+  const [skipUserLabeled, setSkipUserLabeled] = useState(false);
+  const [existingPredictions, setExistingPredictions] = useState<"clear_all" | "replace" | "keep">("replace");
+  // Client-side only — no sleap-nn schema field for this (see trainingStore.ts).
+  const [autoOpenWandb, setAutoOpenWandb] = useState(false);
+  // Client-side only — post-training model export ("none" = don't export) + whether to
+  // run the post-training inference on the exported model (see trainingStore.ts).
+  const [exportFormat, setExportFormat] = useState<"none" | "onnx" | "tensorrt">("none");
+  const [useExportedForInference, setUseExportedForInference] = useState(false);
+  // Auto-open the W&B run page once its URL becomes available, if requested.
+  const openedWandbUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!wandbUrl || !autoOpenWandb) return;
+    if (openedWandbUrlRef.current === wandbUrl) return;
+    openedWandbUrlRef.current = wandbUrl;
+    void openExternal(wandbUrl);
+  }, [wandbUrl, autoOpenWandb]);
+  const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
+  const [fileBrowserCallback, setFileBrowserCallback] = useState<
+    ((path: string) => void) | null
+  >(null);
+
+  const connectionStatus = useConnectStore((s) => s.connectionStatus);
+  const activeTransport = useConnectStore((s) => s.activeTransport);
+  const selectedWorkerId = useConnectStore((s) => s.selectedWorkerId);
+  const pairedWorkers = useConnectStore((s) => s.pairedWorkers);
+  const connectedMounts = useConnectStore((s) => s.workerMounts);
+
+  // Empty (not ["/"]) while disconnected: RemoteFileBrowser treats a single
+  // mount as "browse it directly", which would immediately hit connectStore's
+  // "Not connected to worker" error instead of showing an empty/disabled state.
+  const workerMounts =
+    connectionStatus === "connected" ? connectedMounts.map((m) => m.path) : [];
+
+  // App state
+  const skeleton = useAppStore((s) => s.skeleton);
+  const labels = useAppStore((s) => s.labels);
+  const setModelMetricsDialogOpen = useAppStore(
+    (s) => s.setModelMetricsDialogOpen
+  );
+  const skeletonCompat = useMemo(() => getSkeletonCompatibility(skeleton), [skeleton]);
+  // Skeleton and track edits mutate in place; editSeq changes on every edit,
+  // so the pre-run checks below follow edits made while this panel is open.
+  const editSeq = useAppStore((s) => s.editSeq);
+  // Skeletons with no edges are already disabled for Bottom-Up above.
+  const skeletonTreeProblem = useMemo(() => {
+    if (!skeleton || skeleton.edges.length === 0) return null;
+    const p = arborescenceProblems(skeleton);
+    return p ? arborescenceMessage(p) : null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- editSeq: in-place edits
+  }, [skeleton, editSeq]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- editSeq: in-place edits
+  const hasIdTracks = useMemo(() => hasTrackedUserInstances(labels), [labels, editSeq]);
+  const poseRec = useMemo(() => recommendPipeline(labels as LabelsLike | null), [labels]);
+  // No ground truth to train on (or to derive any suggestion from) — e.g. a
+  // `labels_pr.*.slp` from inference, which holds predictions only. Every
+  // suggester returns null in that case and the config falls back to its
+  // baseline preset, so say why rather than letting the defaults look derived.
+  // Drawn boxes are training data for a box detector; for a pose model they
+  // aren't, which deserves its own message rather than "no labeled frames".
+  const hasUserBoxes = useMemo(
+    () => !!labels?.labeledFrames.some((lf) => (lf.bboxes ?? []).some((b) => !b.isPredicted)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- editSeq: in-place edits
+    [labels, editSeq]
+  );
+  const hasUserPoses = useMemo(
+    () => labels != null && hasUserLabeledInstances(labels),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- editSeq: in-place edits
+    [labels, editSeq]
+  );
+  // Only drawn boxes, no poses: a box detector is the one model these labels
+  // can train, so it's the only model type on offer.
+  const boxesOnly = labels != null && hasUserBoxes && !hasUserPoses;
+  const pipelineRec: PipelineRecommendation | null = boxesOnly
+    ? {
+        recommended: "bbox",
+        reason: "Only bounding boxes are labeled, so a box detector is the model these labels can train. The other model types learn poses: label some poses to use them.",
+        alternatives: [],
+      }
+    : poseRec;
+  const noLabeledData =
+    labels != null && !hasUserPoses && !(hasUserBoxes && config.modelType === "bbox");
+  const boxesOnlyForPoseModel =
+    noLabeledData && hasUserBoxes && config.modelType !== "bbox";
+  // Switch a boxes-only project to Box Detector (never under a running job).
+  const trainingStatus = useTrainingStore((s) => s.status);
+  useEffect(() => {
+    if (boxesOnly && config.modelType !== "bbox" && trainingStatus === "idle") {
+      useTrainingStore.getState().setConfig("modelType", "bbox");
+    }
+  }, [boxesOnly, config.modelType, trainingStatus]);
+
+  // Auto-select the recommended model type for a freshly-loaded project —
+  // mirrors the RF-preset/max_stride auto-select pattern: it only applies
+  // once per distinct `labels` object (a genuine new-project load), and only
+  // when no head configs exist yet (config.configs.length === 0), so it
+  // never overrides a choice the user has already started configuring
+  // around (including after "Train Again", which resets configs but keeps
+  // the same `labels`).
+  const autoSelectedModelTypeForLabels = useRef<typeof labels>(null);
+  useEffect(() => {
+    if (!pipelineRec || labels == null) return;
+    if (autoSelectedModelTypeForLabels.current === labels) return;
+    autoSelectedModelTypeForLabels.current = labels;
+    if (config.configs.length === 0) {
+      setConfig("modelType", pipelineRec.recommended);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [labels, pipelineRec]);
+
+  // Estimated GPU + image-cache memory per head config — shown in the
+  // collapsible section right above the Start Training button.
+  const memoryEstimates = useMemo(
+    () =>
+      config.configs.map((cf) => ({
+        slot: cf.slot,
+        gpu: estimateHeadGpuMemory(labels, cf.slot, cf.hyperparams),
+        cache: estimateHeadCacheMemory(labels, cf.hyperparams),
+      })),
+    [config.configs, labels],
+  );
+
+  // Elapsed time ticker
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (status !== "running" || !startedAt) return;
+    setElapsed(Date.now() - startedAt);
+    const id = setInterval(() => setElapsed(Date.now() - startedAt), 1000);
+    return () => clearInterval(id);
+  }, [status, startedAt]);
+
+  // Auto-scroll log
+  const logRef = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [log.length]);
+
+  const isRunning = status === "running";
+
+  // Predict ▸ Training… asks for the Full Configuration window too: open it
+  // once there's a configuration to show (the recommended model type is
+  // picked for a freshly loaded project), and not over a running job.
+  const configDialogRequest = useAppStore((s) => s.configDialogRequest);
+  useEffect(() => {
+    if (configDialogRequest !== "training") return;
+    if (labels == null || isRunning) {
+      useAppStore.getState().set("configDialogRequest", null);
+      return;
+    }
+    if (config.configs.length === 0) return; // not picked yet: wait for it
+    useAppStore.getState().set("configDialogRequest", null);
+    setConfigDialogOpen(true);
+  }, [configDialogRequest, labels, isRunning, config.configs.length]);
+  const isDone =
+    status === "completed" || status === "error" || status === "stopped";
+
+  // Can start?
+  const requiredSlots = getConfigSlots(config.modelType);
+  const hasAllConfigs = requiredSlots.every((slot) =>
+    config.configs.some((c) => c.slot === slot),
+  );
+  const hasData = remoteEnabled
+    ? labelsSource === "window"
+      ? (labels?.labeledFrames.length ?? 0) > 0
+      : !!remoteLabelsPath
+    : !!config.trainingLabelsPath || !!projectPath;
+  // Remote training points at a path on the worker's filesystem, which this
+  // client can't read to count frames — only guard the local-project path,
+  // where an empty project would otherwise start a doomed training run.
+  // A box detector can also learn from drawn boxes alone (no poses).
+  const hasLabeledFrames = remoteEnabled
+    ? true
+    : (countUserLabeledFrames(labels, {
+        includeBoxes: config.modelType === "bbox",
+        version: editSeq,
+      }) ?? 0) > 0;
+  const remoteUnsupported = remoteEnabled && isBboxModelType(config.modelType);
+  const hasValidLossWeights = config.configs.every((cf) =>
+    cf.hyperparams.confmapsLossWeight > 0 &&
+    cf.hyperparams.pafsLossWeight > 0 &&
+    cf.hyperparams.classLossWeight > 0
+  );
+  // Resume needs a real .ckpt (it's a full Lightning-state restore); Fine-tune
+  // accepts .ckpt or legacy SLEAP .h5 backbone/head weights — see
+  // model_config.pretrained_*_weights vs trainer_config.resume_ckpt_path in
+  // sleap-nn's lightning_modules.py / trainer_config.py.
+  const hasValidCheckpointSelection = config.configs.every((cf) => {
+    const mode = cf.hyperparams.trainingMode;
+    if (mode === "reuse_config") return true;
+    if (!cf.checkpointPath?.trim()) return false;
+    if (mode === "resume") return cf.checkpointPath.toLowerCase().endsWith(".ckpt");
+    return true;
+  });
+  const isModelTypeIncompatible = skeletonCompat.disabledTypes.has(config.modelType);
+  // "window" + still-unknown visibility blocks Start: classifyVisibility(null
+  // ?? []) would otherwise read as case "all" (same as "nothing hidden"),
+  // skipping HiddenVideosDialog even if the in-flight check later finds a
+  // hidden video. RemoteDataSummary's debounce is short, so this only ever
+  // gates the brief window right after picking/reconnecting a worker.
+  const visibilityPending = remoteEnabled && labelsSource === "window" && visibility === null;
+  // Legacy SLEAP's pre-run checks. Only when training on this window's labels:
+  // a separately picked or worker-side labels file can't be read from here.
+  const trainsOnOpenLabels = remoteEnabled ? labelsSource === "window" : !config.trainingLabelsPath;
+  const pipelineProblem = !trainsOnOpenLabels
+    ? null
+    : (config.modelType === "top_down_id" || config.modelType === "bottom_up_id") && !hasIdTracks
+      ? ID_NO_TRACKS_MESSAGE
+      : config.modelType === "bottom_up"
+        ? skeletonTreeProblem
+        : null;
+  const canStart =
+    !pipelineProblem &&
+    hasAllConfigs &&
+    hasData &&
+    hasLabeledFrames &&
+    hasValidLossWeights &&
+    hasValidCheckpointSelection &&
+    !isModelTypeIncompatible &&
+    !remoteUnsupported &&
+    !visibilityPending &&
+    status === "idle" &&
+    (remoteEnabled ? !!selectedWorkerId && connectionStatus === "connected" : true);
+
+  // Config upload via file dialog
+  const handleConfigBrowse = (slot: string) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".yaml,.yml";
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const text = reader.result as string;
+          const { parseYamlConfig, addConfigFile } =
+            useTrainingStore.getState();
+          const parsed = parseYamlConfig(text, file.name, slot);
+          if (parsed) {
+            addConfigFile(parsed);
+          }
+        };
+        reader.readAsText(file);
+      }
+    };
+    input.click();
+  };
+
+  // Local data path browse
+  const handleBrowseLocalData = async (
+    setter: (path: string) => void,
+    configKey: "trainingLabelsPath" | "validationLabelsPath",
+  ) => {
+    try {
+      const { open: tauriOpen } = await import("@tauri-apps/plugin-dialog");
+      const selected = await tauriOpen({
+        title: "Select Labels File",
+        filters: [{ name: "SLP Files", extensions: ["slp"] }],
+      });
+      if (selected) {
+        setter(selected as string);
+        setConfig(configKey, selected as string);
+      }
+    } catch {
+      /* cancelled */
+    }
+  };
+
+  /** labelsSource "window", visibility case "all" (or re-confirmed via HiddenVideosDialog): actually submit. */
+  const startRemoteWindowTraining = async (embedFramesToPredict: boolean) => {
+    await startTraining({
+      remote: true,
+      workerId: selectedWorkerId!,
+      labelsSource: "window",
+      // Pass along whatever RemoteDataSummary has found so far — trainingStore
+      // recomputes it itself (via checkVideoVisibility) if still unknown.
+      visibility: visibility ?? undefined,
+      embedFramesToPredict,
+      outputDir: remoteOutputDir ?? undefined,
+      valLabelsPath: remoteValLabelsPath || undefined,
+      inferenceTarget,
+      sampleCount,
+      skipUserLabeled,
+      existingPredictions,
+    });
+  };
+
+  const handleStart = async () => {
+    if (remoteEnabled) {
+      if (labelsSource === "worker-file") {
+        await startTraining({
+          remote: true,
+          workerId: selectedWorkerId!,
+          labelsSource: "worker-file",
+          workerLabelsPath: remoteLabelsPath,
+          valLabelsPath: remoteValLabelsPath || undefined,
+          inferenceTarget,
+          sampleCount,
+          skipUserLabeled,
+          existingPredictions,
+        });
+        return;
+      }
+      // "window": every video visible (or not yet known — trainingStore will
+      // check itself) starts right away; otherwise confirm via the dialog
+      // before possibly embedding pixels and/or narrowing inference coverage.
+      if (classifyVisibility(visibility ?? []) === "all") {
+        await startRemoteWindowTraining(false);
+      } else {
+        setHiddenDialogOpen(true);
+      }
+      return;
+    }
+    await startTraining({
+      inferenceTarget,
+      sampleCount,
+      skipUserLabeled,
+      existingPredictions,
+      exportFormat,
+      useExportedForInference,
+    });
+  };
+
+  if (!isTauri && connectionStatus !== "connected") {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
+        <p className="text-xs text-muted-foreground">
+          Connect to a worker in the Connect tab to start remote training.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-0 -m-2">
+      {noLabeledData && (
+        <div className="mx-3 mt-2 flex items-start gap-2 rounded-md border border-yellow-500/50 bg-yellow-500/10 px-2 py-1.5">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5 text-yellow-500" />
+          <p className="text-xs text-yellow-500">
+            {boxesOnlyForPoseModel ? (
+              <>
+                This project has bounding boxes but no pose labels. To train on
+                the boxes, choose <strong>Box Detector</strong> under Model Type;
+                the other model types learn poses, so label some poses first.
+              </>
+            ) : (
+              <>
+                No labeled frames in this project — predicted instances aren&apos;t
+                training data. The settings below are a baseline preset; label some
+                frames to get suggestions tailored to your data.
+              </>
+            )}
+          </p>
+        </div>
+      )}
+      {/* ── Configuration ──────────────────────────────────────────── */}
+      <div className="px-3 py-2 space-y-1">
+        {/* ── Model Type & Configs ─────────────────────────────────── */}
+        <Section title="Model Type & Configs" defaultOpen={true}>
+          <div className="space-y-1">
+            <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+              Model Type
+              <HelpTooltip text="The pose-estimation pipeline to train. Single Animal predicts node locations for one animal per frame. Top-Down uses a centroid model to locate/crop each animal, then a centered-instance model for its pose. Bottom-Up predicts all keypoints and groups them into animals via part affinity fields. The '+ ID' variants also classify each instance's identity. Box Detector predicts a box around each animal (no poses); Top-Down (Box Crops) uses that detector in place of the centroid model and crops each animal to its box. Box models need sleap-nn 0.3.5 or newer." />
+            </span>
+            <Select
+              value={config.modelType}
+              onValueChange={(v) => setConfig("modelType", v as ModelType)}
+              disabled={isRunning}
+            >
+              <SelectTrigger className="h-7 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {MODEL_TYPE_OPTIONS.map((o) => {
+                  const needsPoses = boxesOnly && o.value !== "bbox";
+                  const needsEdges = skeletonCompat.disabledTypes.has(o.value);
+                  const isDisabled = needsPoses || needsEdges;
+                  const isRecommended = pipelineRec?.recommended === o.value;
+                  return (
+                    <SelectItem key={o.value} value={o.value} disabled={isDisabled}>
+                      {o.label}{needsPoses ? " (needs pose labels)" : needsEdges ? " (requires edges)" : ""}
+                      {isRecommended && !isDisabled ? " ★" : ""}
+                      {skeletonCompat.warnings.has(o.value) ? " ⚠" : ""}
+                    </SelectItem>
+                  );
+                })}
+              </SelectContent>
+            </Select>
+            {pipelineRec && !skeletonCompat.disabledTypes.has(config.modelType) && (
+              <p className="text-[10px] text-green-400">
+                <Lightbulb className="mr-1 inline h-3 w-3 align-[-2px]" />
+                {config.modelType === pipelineRec.recommended
+                  ? pipelineRec.reason
+                  : `Recommended: ${MODEL_TYPE_OPTIONS.find((o) => o.value === pipelineRec.recommended)?.label} — ${pipelineRec.reason}`}
+              </p>
+            )}
+            {skeletonCompat.warnings.has(config.modelType) && (
+              <p className="text-[10px] text-yellow-400">⚠ {skeletonCompat.warnings.get(config.modelType)}</p>
+            )}
+            {isModelTypeIncompatible && (
+              <p className="text-[10px] text-red-400">Selected model type is incompatible with the current skeleton</p>
+            )}
+            {pipelineProblem && (
+              <p className="text-[10px] text-red-400" data-testid="training-pipeline-problem">{pipelineProblem}</p>
+            )}
+          </div>
+
+          {requiredSlots.map((slot) => {
+            const configFile = config.configs.find((c) => c.slot === slot);
+            return (
+              <div key={slot} className="space-y-1">
+                <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                  {getSlotLabel(slot)}
+                  <HelpTooltip text="Config file for this model in the pipeline. Auto-discovered training_config.yaml files from prior runs are picked up automatically; you can also browse to a specific config or a directory of already-trained model checkpoints to reuse." />
+                </span>
+                <ConfigSlot
+                  slot={slot}
+                  modelType={config.modelType}
+                  configFile={configFile}
+                  discoveredModels={discoveredModels}
+                  onAdd={handleConfigBrowse}
+                  onRemove={removeConfigFile}
+                  disabled={isRunning}
+                />
+              </div>
+            );
+          })}
+
+          {hasAllConfigs && config.configs.length > 0 && (
+            <div className="bg-green-500/8 border border-green-500/20 rounded-md p-2 text-[11px] text-green-400">
+              Auto-filled from config files. All fields are editable.
+            </div>
+          )}
+        </Section>
+
+        <Separator />
+
+        {/* ── Data ─────────────────────────────────────────────────── */}
+        <Section title="Data" defaultOpen={true}>
+          <div className="space-y-1">
+            <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+              Training Labels
+              <HelpTooltip text="The .slp file whose labeled frames are used to train the model. Defaults to the currently open project." />
+            </span>
+            {remoteEnabled ? (
+              <div className="space-y-1.5">
+                <RadioGroup
+                  value={labelsSource}
+                  onValueChange={(v) => setLabelsSource(v as "window" | "worker-file")}
+                  className="gap-1"
+                >
+                  <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                    <RadioGroupItem value="window" id="labels-source-window" disabled={isRunning} />
+                    This window ({projectPath ? projectTag(projectPath).name : (filename ?? "untitled.slp")})
+                  </label>
+                  <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                    <RadioGroupItem value="worker-file" id="labels-source-worker-file" disabled={isRunning} />
+                    A file on {pairedWorkers.find((w) => w.nodeId === selectedWorkerId)?.label ?? "worker"}
+                  </label>
+                </RadioGroup>
+                {labelsSource === "worker-file" && (
+                  <div className="flex gap-1 pl-5">
+                    <Input
+                      value={remoteLabelsPath}
+                      readOnly
+                      className="h-7 text-xs font-mono flex-1"
+                      placeholder="No file selected"
+                    />
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      className="px-2"
+                      disabled={isRunning}
+                      onClick={() => {
+                        setFileBrowserCallback(
+                          () => (path: string) => setRemoteLabelsPath(path),
+                        );
+                        setFileBrowserOpen(true);
+                      }}
+                    >
+                      <Folder className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                )}
+                {labelsSource === "window" && (
+                  <RemoteDataSummary
+                    workerId={selectedWorkerId}
+                    labels={labels}
+                    onResult={setVisibility}
+                  />
+                )}
+                <RemoteOutputFolder
+                  workerId={selectedWorkerId}
+                  labelsSource={labelsSource}
+                  workerLabelsPath={remoteLabelsPath || undefined}
+                  projectPath={projectPath}
+                  filename={filename}
+                  onChange={setRemoteOutputDir}
+                />
+              </div>
+            ) : (
+              <div className="flex gap-1">
+                <Input
+                  value={config.trainingLabelsPath || projectPath || ""}
+                  readOnly
+                  className="h-7 text-xs font-mono flex-1"
+                  placeholder="No file selected"
+                />
+                <Button
+                  variant="outline"
+                  size="xs"
+                  className="px-2"
+                  disabled={isRunning}
+                  onClick={() =>
+                    handleBrowseLocalData(
+                      (p) => setConfig("trainingLabelsPath", p),
+                      "trainingLabelsPath",
+                    )
+                  }
+                >
+                  <Folder className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            )}
+          </div>
+          <div className="space-y-1">
+            <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+              Validation Labels (optional)
+              <HelpTooltip text="A separate .slp file to hold out for validation instead of splitting it from the training labels. Leave empty to auto-split a fraction of the training labels (see Validation Fraction in the per-model Data settings)." />
+            </span>
+            <div className="flex gap-1">
+              <Input
+                value={
+                  remoteEnabled
+                    ? remoteValLabelsPath
+                    : config.validationLabelsPath
+                }
+                readOnly
+                className="h-7 text-xs font-mono flex-1"
+                placeholder="Same as training (auto-split)"
+              />
+              <Button
+                variant="outline"
+                size="xs"
+                className="px-2"
+                disabled={isRunning}
+                onClick={() => {
+                  if (remoteEnabled) {
+                    setFileBrowserCallback(
+                      () => (path: string) => setRemoteValLabelsPath(path),
+                    );
+                    setFileBrowserOpen(true);
+                  } else {
+                    handleBrowseLocalData(
+                      (p) => setConfig("validationLabelsPath", p),
+                      "validationLabelsPath",
+                    );
+                  }
+                }}
+              >
+                <Folder className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+
+          <div className="space-y-1">
+            <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+              Post-Training Inference Target
+              <HelpTooltip text="Which frames to run inference on after training completes. Predictions will be merged back into the project." />
+            </span>
+            <Select
+              value={inferenceTarget}
+              onValueChange={(v) => setInferenceTarget(v)}
+              disabled={isRunning}
+            >
+              <SelectTrigger
+                className="h-7 text-xs"
+                data-tutorial="post-training-inference-target-select"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {POST_TRAINING_TARGET_OPTIONS.map((o) => (
+                  <SelectItem key={o.value} value={o.value} disabled={o.value === "clip" && !clipDescription}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {inferenceTarget === "clip" && (
+              <p className={`text-[10px] mt-1 ${clipDescription ? "text-muted-foreground" : "text-destructive"}`}>
+                {clipDescription ?? "No clip selected — inference will be skipped"}
+              </p>
+            )}
+            {(inferenceTarget === "random_video" || inferenceTarget === "random") && (
+              <div className="flex items-center justify-between gap-2 mt-1">
+                <span className="text-[10px] text-muted-foreground shrink-0 flex items-center gap-1">
+                  Sample count
+                  <HelpTooltip text="How many frames to randomly sample for post-training inference." />
+                </span>
+                <NumberInput min={1} integer value={sampleCount}
+                  onCommit={(n) => setSampleCount(n)}
+                  className="h-6 text-[10px] w-20" disabled={isRunning} />
+              </div>
+            )}
+          </div>
+        </Section>
+
+        <Separator />
+
+        {/* ── Hyperparameters (per-config tabs) ─────────────────── */}
+        <Section title="Hyperparameters" defaultOpen={true}>
+          {config.configs.length === 0 ? (
+            <p className="text-[10px] text-muted-foreground">
+              Upload config file(s) above to see hyperparameters.
+            </p>
+          ) : (
+            <>
+              {/* Shared across the centroid/centered-instance split — it's one
+                  concept (where to crop), so it lives above that division. */}
+              {(() => {
+                const ciConfig = config.configs.find((cf) => cf.slot === "centered_instance");
+                // A top-down-box pipeline crops around each predicted box, not an anchor part.
+                if (!ciConfig || config.modelType === "top_down_bbox") return null;
+                return (
+                  <>
+                    <AnchorPartField
+                      hp={ciConfig.hyperparams}
+                      onUpdate={(updates) => updateConfigHyperparams("centered_instance", updates)}
+                      disabled={isRunning}
+                    />
+                    <Separator className="my-2" />
+                  </>
+                );
+              })()}
+              {isBboxModelType(config.modelType) && (
+                <>
+                  <BboxTrainingFields
+                    modelType={config.modelType}
+                    configs={config.configs}
+                    onUpdateSlot={updateConfigHyperparams}
+                    disabled={isRunning}
+                  />
+                  <Separator className="my-2" />
+                </>
+              )}
+              {config.configs.length === 1 ? (
+                <HyperparamsFields
+                  slot={config.configs[0].slot}
+                  hp={config.configs[0].hyperparams}
+                  onUpdate={updateConfigHyperparams}
+                  disabled={isRunning}
+                />
+              ) : (
+                <Tabs defaultValue={config.configs[0]?.slot}>
+                  <TabsList className="w-full h-7">
+                    {config.configs.map((cf) => (
+                      <TabsTrigger key={cf.slot} value={cf.slot} className="flex-1 text-[10px] h-6">
+                        {getSlotLabel(cf.slot).replace(" Config", "")}
+                      </TabsTrigger>
+                    ))}
+                  </TabsList>
+                  {config.configs.map((cf) => (
+                    <TabsContent key={cf.slot} value={cf.slot} className="mt-2">
+                      <HyperparamsFields
+                        slot={cf.slot}
+                        hp={cf.hyperparams}
+                        onUpdate={updateConfigHyperparams}
+                        disabled={isRunning}
+                      />
+                    </TabsContent>
+                  ))}
+                </Tabs>
+              )}
+            </>
+          )}
+        </Section>
+
+        {isTauri && (
+          <>
+            <Separator />
+
+            {/* ── Remote (desktop only — web is always remote) ──────── */}
+            <Section title="Remote" defaultOpen={false}>
+              <BackendPicker
+                jobLabel="training job"
+                remoteEnabled={remoteEnabled}
+                onRemoteEnabledChange={setRemoteEnabled}
+              />
+            </Section>
+          </>
+        )}
+
+        <Separator />
+
+        {/* ── W&B link (shown as soon as available) ─────────────── */}
+        {wandbUrl && (
+          <a
+            href={wandbUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 text-[11px] text-blue-400 hover:underline bg-blue-500/8 border border-blue-500/20 rounded-md px-2 py-1.5"
+          >
+            <ExternalLink className="h-3 w-3" />
+            View on Weights & Biases
+          </a>
+        )}
+
+        {/* ── Action buttons ──────────────────────────────────────── */}
+        {config.configs.length > 0 && (
+          <Button
+            variant="outline"
+            className="w-full h-8 text-xs border-blue-500/50 text-blue-400 hover:bg-blue-500/10"
+            onClick={() => setConfigDialogOpen(true)}
+            disabled={isRunning}
+          >
+            <Settings2 className="h-3 w-3 mr-1.5" />
+            Full Configuration...
+          </Button>
+        )}
+        {memoryEstimates.length > 0 && (
+          <Section title="Estimated Memory Usage">
+            <div className="space-y-3">
+              {memoryEstimates.map(({ slot, gpu, cache }) => (
+                <div key={slot} className="space-y-1">
+                  <div className="flex items-center justify-between gap-2 text-[11px]">
+                    <span className="font-medium shrink-0">{getSlotLabel(slot).replace(" Config", "")}</span>
+                    {gpu ? (
+                      <span className={`text-right ${GPU_MEMORY_LEVEL_COLOR[gpu.level]}`}>
+                        ~{formatBytes(gpu.totalBytes)} — {gpu.message}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground text-right">Not enough data to estimate</span>
+                    )}
+                  </div>
+                  {gpu && (
+                    <div className="pl-2 space-y-0.5 text-[10px] text-muted-foreground">
+                      <div className="flex items-center justify-between"><span>Params</span><span>{formatParamCount(gpu.numParams)}</span></div>
+                      <div className="flex items-center justify-between"><span>Weights</span><span>{formatBytes(gpu.weightsBytes)}</span></div>
+                      <div className="flex items-center justify-between"><span>Batch Images</span><span>{formatBytes(gpu.batchImgBytes)}</span></div>
+                      <div className="flex items-center justify-between"><span>Activations</span><span>{formatBytes(gpu.activationBytes)}</span></div>
+                      <div className="flex items-center justify-between"><span>Conf Maps</span><span>{formatBytes(gpu.confmapBytes)}</span></div>
+                      <div className="flex items-center justify-between"><span>Gradients</span><span>{formatBytes(gpu.gradientBytes)}</span></div>
+                      <div className="flex items-center justify-between">
+                        <span>Input Size</span>
+                        <span className={gpu.paddedHeight !== gpu.scaledHeight || gpu.paddedWidth !== gpu.scaledWidth ? "text-orange-400" : "text-green-400"}>
+                          {Math.round(gpu.scaledWidth)}×{Math.round(gpu.scaledHeight)} → {gpu.paddedWidth}×{gpu.paddedHeight}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                  {cache && (
+                    <div className="flex items-center justify-between gap-2 text-[11px] pl-2">
+                      <span className="text-muted-foreground">Image Cache</span>
+                      <span className={cache.isDisk ? "text-muted-foreground" : GPU_MEMORY_LEVEL_COLOR[cache.level]}>
+                        ~{formatBytes(cache.totalBytes)} {cache.message}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </Section>
+        )}
+        {status === "idle" && (
+          <>
+            <div className="flex gap-2">
+              <Button
+                className="flex-1 h-8 text-xs"
+                onClick={handleStart}
+                disabled={!canStart || dryRunning}
+                data-tutorial="start-training-button"
+              >
+                <Upload className="h-3.5 w-3.5 mr-1.5" />
+                {remoteEnabled ? "Start Remote Training" : "Start Training"}
+              </Button>
+              {/* sleap-nn's --dry-run runs here, on this machine; a worker has
+                  no way to run one yet. */}
+              {isTauri && !remoteEnabled && (
+                <Button
+                  variant="outline"
+                  className="h-8 text-xs"
+                  onClick={() => startDryRun()}
+                  disabled={!canStart || dryRunning}
+                  title="Check the config and data first, in seconds: setup plus one training and one validation batch per model, with your settings. Also checks it can save to the model folder; nothing is kept."
+                >
+                  <FlaskConical className="h-3.5 w-3.5 mr-1.5" />
+                  Dry run
+                </Button>
+              )}
+            </div>
+            {dryRun && !remoteEnabled && <DryRunResult dryRun={dryRun} />}
+            {!canStart && (
+              <p className="text-[10px] text-muted-foreground text-center mt-1">
+                {pipelineProblem
+                  ? "Fix the problem under Model Type to start"
+                  : remoteUnsupported
+                  ? BBOX_REMOTE_UNSUPPORTED
+                  : !hasAllConfigs
+                  ? "Upload config file(s) to begin"
+                  : !hasData
+                    ? "Select training data"
+                    : !hasLabeledFrames
+                      ? "Label at least one frame before training"
+                      : !hasValidCheckpointSelection
+                        ? "Select a checkpoint file for Resume/Fine-tune"
+                        : remoteEnabled && !selectedWorkerId
+                          ? "Select a worker"
+                          : visibilityPending
+                            ? "Checking video visibility on the worker..."
+                            : ""}
+              </p>
+            )}
+          </>
+        )}
+
+        {isRunning && (
+          <div className="flex gap-2">
+            {!inferenceRunning && (
+              <Button
+                variant="outline"
+                className="flex-1 h-8 text-xs border-yellow-500/50 text-yellow-500 hover:bg-yellow-500/10"
+                onClick={() => stopTraining()}
+              >
+                <Square className="h-3 w-3 mr-1" />
+                Stop Early
+              </Button>
+            )}
+            <Button
+              variant="destructive"
+              className="flex-1 h-8 text-xs"
+              onClick={() => cancelTraining()}
+            >
+              <X className="h-3.5 w-3.5 mr-1" />
+              Cancel
+            </Button>
+          </div>
+        )}
+
+        {isRunning && (
+          <p className="text-[9px] text-muted-foreground text-center">
+            Stop Early saves a checkpoint. Cancel terminates immediately.
+          </p>
+        )}
+
+        {status === "completed" && modelOutputDirs.length > 0 && (
+          <div className="bg-green-500/8 border border-green-500/20 rounded-md p-2 text-[11px] text-green-400 space-y-1">
+            <div className="font-medium">Trained model{modelOutputDirs.length > 1 ? "s" : ""}:</div>
+            {modelOutputDirs.map((dir, i) => (
+              <div key={i} className="font-mono text-[10px] text-green-300 break-all">{dir}</div>
+            ))}
+          </div>
+        )}
+        {/* Remote post-training inference runs as its own track job; its
+            predictions are fetched only on this explicit click (same
+            rationale as the Inference panel's Fetch & Load — see
+            PostTrainingInference in trainingStore.ts). */}
+        {postTrainingInference && (
+          <div
+            className={`rounded-md border p-2 text-[11px] space-y-1.5 ${
+              postTrainingInference.status === "error"
+                ? "bg-destructive/8 border-destructive/30 text-destructive"
+                : "bg-muted/40 border-border text-muted-foreground"
+            }`}
+          >
+            <div className="flex items-center gap-1.5">
+              {postTrainingInference.status === "running" && <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />}
+              {postTrainingInference.status === "completed" && <CheckCircle2 className="h-3.5 w-3.5 text-green-500" />}
+              {postTrainingInference.status === "error" && <XCircle className="h-3.5 w-3.5" />}
+              {postTrainingInference.status === "skipped" && <AlertCircle className="h-3.5 w-3.5 text-yellow-500" />}
+              <span className="font-medium">
+                {postTrainingInference.status === "running"
+                  ? "Running post-training inference on the worker..."
+                  : postTrainingInference.status === "completed"
+                    ? postTrainingInference.merged
+                      ? "Predictions merged into the project."
+                      : "Post-training inference complete."
+                    : postTrainingInference.status === "error"
+                      ? "Post-training inference failed."
+                      : "Post-training inference skipped."}
+              </span>
+            </div>
+            {postTrainingInference.message && (
+              <div className="text-[10px] break-words">{postTrainingInference.message}</div>
+            )}
+            {postTrainingInference.pendingMerge && (
+              <Button
+                size="sm"
+                className="w-full h-7 text-xs"
+                disabled={fetchingPredictions}
+                onClick={async () => {
+                  setFetchingPredictions(true);
+                  await fetchAndLoadPostTrainingPredictions();
+                  setFetchingPredictions(false);
+                }}
+              >
+                {fetchingPredictions ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Download className="h-3.5 w-3.5 mr-1" />}
+                {fetchingPredictions ? "Fetching..." : "Fetch & Load Predictions"}
+              </Button>
+            )}
+          </div>
+        )}
+        {status === "completed" && (
+          <Button
+            variant="outline"
+            className="w-full h-8 text-xs"
+            onClick={() => setModelMetricsDialogOpen(true)}
+          >
+            <BarChart3 className="h-3.5 w-3.5 mr-1" />
+            View Metrics
+          </Button>
+        )}
+        {status === "completed" && isTauri && modelOutputDirs.length > 0 && (
+          <Button
+            variant="outline"
+            className="w-full h-8 text-xs"
+            onClick={() => openExport(modelOutputDirs)}
+            title="Export the trained model to ONNX/TensorRT for faster inference"
+          >
+            Export Model…
+          </Button>
+        )}
+        {status === "completed" && (
+          <Button className="w-full h-8 text-xs" onClick={() => reset()}>
+            Train Again
+          </Button>
+        )}
+
+        {(status === "error" || status === "stopped") && (
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              className="flex-1 h-8 text-xs"
+              onClick={() => {
+                const savedConfig = { ...config };
+                reset();
+                // Restore config for retry
+                Object.entries(savedConfig).forEach(([key, value]) => {
+                  setConfig(
+                    key as keyof typeof savedConfig,
+                    value as never,
+                  );
+                });
+              }}
+            >
+              Retry
+            </Button>
+            <Button className="flex-1 h-8 text-xs" onClick={() => reset()}>
+              New Training
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {/* ── Progress ──────────────────────────────────────────────── */}
+      {_isRemote && status === "running" && !watching ? (
+        <>
+          <Separator />
+          <div className="px-3 py-2">
+            <RemoteRunCard
+              workerLabel={pairedWorkers.find((w) => w.nodeId === selectedWorkerId)?.label ?? "worker"}
+              connectionStatus={connectionStatus}
+              activeTransport={activeTransport}
+              startedAt={startedAt}
+              models={models}
+              currentModelIndex={currentModelIndex}
+              postTrainingInference={postTrainingInference}
+              onWatchLive={() => {
+                setWatching(true);
+                setViewerIndex(currentModelIndex);
+              }}
+              onOpenConnect={() => useAppStore.getState().setConnectWindowOpen(true)}
+            />
+          </div>
+        </>
+      ) : (
+      (isRunning || isDone) && models.length > 0 && (
+        <>
+          <Separator />
+          <div className="px-3 py-2 space-y-2" data-tutorial="training-progress">
+            {/* Status header */}
+            <div className="flex items-center gap-2">
+              {isRunning && (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                  <span className="text-xs font-medium">Training...</span>
+                </>
+              )}
+              {status === "completed" && (
+                <>
+                  <CheckCircle2 className="h-4 w-4 text-green-500" />
+                  <span className="text-xs font-medium">Complete</span>
+                </>
+              )}
+              {status === "error" && (
+                <>
+                  <XCircle className="h-4 w-4 text-destructive" />
+                  <span className="text-xs font-medium">Failed</span>
+                </>
+              )}
+              {status === "stopped" && (
+                <>
+                  <AlertCircle className="h-4 w-4 text-yellow-500" />
+                  <span className="text-xs font-medium">Stopped</span>
+                </>
+              )}
+              {startedAt && (
+                <span className="text-[10px] text-muted-foreground ml-auto">
+                  {formatDuration(isDone ? elapsed : Date.now() - startedAt)}
+                </span>
+              )}
+              {_isRemote && isRunning && watching && (
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  className="h-5 px-1.5 text-[10px]"
+                  onClick={() => setWatching(false)}
+                >
+                  Hide
+                </Button>
+              )}
+            </div>
+
+            {/* Completion banner */}
+            {status === "completed" && (
+              <div className="bg-green-500/8 border border-green-500/20 rounded-md p-2 text-[11px] text-green-400">
+                <b>Training complete!</b>{" "}
+                {models.length > 1
+                  ? `All ${models.length} models trained successfully.`
+                  : "Model trained successfully."}
+              </div>
+            )}
+
+            {/* Per-model progress */}
+            {models.map((model, i) => {
+              const pct =
+                model.maxEpochs > 0
+                  ? (model.epoch / model.maxEpochs) * 100
+                  : 0;
+              const isCompleted = model.status === "completed";
+              const isFailed = model.status === "failed";
+              const isCancelled = model.status === "cancelled";
+              const isCurrent = i === currentModelIndex && isRunning;
+
+              return (
+                <div
+                  key={i}
+                  className={isCompleted && !isDone ? "opacity-70" : ""}
+                >
+                  {(() => {
+                    const hasChart = isCurrent || isCompleted || isFailed || isCancelled;
+                    return (
+                      <div
+                        role={hasChart ? "button" : undefined}
+                        tabIndex={hasChart ? 0 : undefined}
+                        onClick={() => {
+                          if (hasChart) setViewerIndex(i);
+                        }}
+                        onKeyDown={(e) => {
+                          if (hasChart && (e.key === "Enter" || e.key === " ")) {
+                            e.preventDefault();
+                            setViewerIndex(i);
+                          }
+                        }}
+                        className={`text-[11px] font-medium flex items-center gap-1.5 mb-1 ${
+                          isFailed
+                            ? "text-destructive"
+                            : isCancelled
+                              ? "text-muted-foreground"
+                              : isCompleted
+                                ? "text-green-500"
+                                : "text-primary"
+                        } ${hasChart ? "cursor-pointer hover:underline" : ""}`}
+                      >
+                        {isCompleted && (
+                          <CheckCircle2 className="h-3 w-3" />
+                        )}
+                        {isFailed && <XCircle className="h-3 w-3" />}
+                        {isCancelled && <Ban className="h-3 w-3" />}
+                        {isCurrent && (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        )}
+                        {model.status === "pending" && (
+                          <span className="w-3 h-3 rounded-full border border-muted-foreground/30" />
+                        )}
+                        {isCurrent
+                          ? `Training: ${model.label} (${i + 1}/${models.length})`
+                          : isCompleted
+                            ? `${model.label} — ${model.epochSamples.length} epochs${
+                                model.bestValLoss != null
+                                  ? `, best val_loss: ${model.bestValLoss.toFixed(4)}`
+                                  : ""
+                              }`
+                            : isFailed
+                              ? `${model.label} — failed at epoch ${model.epoch}`
+                              : isCancelled
+                                ? `${model.label} — cancelled at epoch ${model.epoch}`
+                                : isRunning
+                                  ? `${model.label} (pending)`
+                                  : `${model.label} (not started)`}
+                        {hasChart && (
+                          <LineChart className="h-3 w-3 ml-auto opacity-60" />
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {/* Progress bar */}
+                  <div className="h-1.5 w-full rounded-full bg-secondary overflow-hidden mb-1">
+                    <div
+                      className={`h-full transition-all duration-300 ${
+                        isFailed
+                          ? "bg-destructive"
+                          : isCancelled
+                            ? "bg-muted-foreground/40"
+                            : isCompleted
+                              ? "bg-green-500"
+                              : "bg-primary"
+                      }`}
+                      style={{
+                        width: `${Math.max(0, Math.min(100, pct))}%`,
+                      }}
+                    />
+                  </div>
+
+                  {/* Stats */}
+                  {(isCurrent || isCompleted || isFailed || isCancelled) && (
+                    <div className="flex justify-between text-[10px] text-muted-foreground mb-1">
+                      <span>
+                        {model.epoch} / {model.maxEpochs} epochs
+                      </span>
+                      {model.loss != null && (
+                        <span>loss: {model.loss.toFixed(4)}</span>
+                      )}
+                    </div>
+                  )}
+
+                </div>
+              );
+            })}
+
+            {/* Single shared log terminal */}
+            {log.length > 0 && (
+              <div className="space-y-1">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-muted-foreground">Log</span>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-1.5 text-[10px]"
+                      onClick={() => setLogDialogOpen(true)}
+                    >
+                      <Maximize2 className="h-3 w-3 mr-1" /> Expand
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-1.5 text-[10px]"
+                      onClick={() => navigator.clipboard.writeText(log.join("\n"))}
+                    >
+                      <Copy className="h-3 w-3 mr-1" /> Copy
+                    </Button>
+                  </div>
+                </div>
+                <pre
+                  ref={logRef}
+                  onClick={() => setLogDialogOpen(true)}
+                  title="Click to open the full log"
+                  className="max-h-48 overflow-auto rounded border bg-muted p-1.5 text-[10px] font-mono whitespace-pre-wrap break-all cursor-pointer hover:border-muted-foreground/50"
+                >
+                  {logLines}
+                </pre>
+              </div>
+            )}
+
+            {/* Error banner + forwarded sleap-nn error output */}
+            {error && status === "error" && (
+              <div className="rounded-md bg-destructive/15 border border-destructive/30 px-2 py-1.5 text-[10px] text-destructive">
+                {error}
+              </div>
+            )}
+            {status === "error" && stderrTail.length > 0 && (
+              <ErrorOutput lines={stderrTail} title="Error output (sleap-nn)" />
+            )}
+
+            {/* Next step hint */}
+            {status === "completed" && (
+              <div className="bg-blue-500/8 border border-blue-500/20 rounded-md p-2 text-[11px] text-blue-400">
+                <b>Next step:</b> Use these models in the Inference tab to run
+                predictions on your data.
+              </div>
+            )}
+          </div>
+        </>
+      )
+      )}
+
+      <LogTerminalDialog
+        open={logDialogOpen}
+        onOpenChange={setLogDialogOpen}
+        log={log}
+        title="Training log"
+      />
+
+      <LossViewerDialog
+        open={viewerIndex !== null}
+        onOpenChange={(o) => {
+          if (!o) setViewerIndex(null);
+        }}
+        model={viewerIndex !== null ? (models[viewerIndex] ?? null) : null}
+        startedAt={startedAt}
+        status={status}
+        errorLines={stderrTail}
+        isActive={
+          viewerIndex !== null &&
+          viewerIndex === currentModelIndex &&
+          isRunning &&
+          !inferenceRunning
+        }
+        onStopEarly={() => stopTraining()}
+        onCancel={() => cancelTraining()}
+      />
+
+      <RemoteFileBrowser
+        open={fileBrowserOpen}
+        onClose={() => setFileBrowserOpen(false)}
+        onSelect={(path) => {
+          if (fileBrowserCallback) fileBrowserCallback(path);
+          setFileBrowserOpen(false);
+        }}
+        mounts={workerMounts}
+        mode="file"
+        fileFilter=".slp"
+      />
+
+      {labels && (
+        <HiddenVideosDialog
+          open={hiddenDialogOpen}
+          onClose={() => setHiddenDialogOpen(false)}
+          labels={labels}
+          visibility={visibility ?? []}
+          inferenceTarget={inferenceTarget}
+          onTrain={(opts) => void startRemoteWindowTraining(opts.embedFramesToPredict)}
+        />
+      )}
+
+      <TrainingConfigDialog
+        open={configDialogOpen}
+        onClose={() => setConfigDialogOpen(false)}
+        modelType={config.modelType}
+        configs={config.configs}
+        onUpdateSlot={updateConfigHyperparams}
+        inferenceTarget={inferenceTarget}
+        onInferenceTargetChange={setInferenceTarget}
+        remoteEnabled={remoteEnabled}
+        onRemoteEnabledChange={setRemoteEnabled}
+        skeletonNodes={(() => {
+          const skeleton = useAppStore.getState().skeleton;
+          return skeleton?.nodes?.map((n) => n.name) ?? [];
+        })()}
+        sampleCount={sampleCount}
+        onSampleCountChange={setSampleCount}
+        skipUserLabeled={skipUserLabeled}
+        onSkipUserLabeledChange={setSkipUserLabeled}
+        existingPredictions={existingPredictions}
+        onExistingPredictionsChange={setExistingPredictions}
+        autoOpenWandb={autoOpenWandb}
+        onAutoOpenWandbChange={setAutoOpenWandb}
+        exportFormat={exportFormat}
+        onExportFormatChange={setExportFormat}
+        useExportedForInference={useExportedForInference}
+        onUseExportedForInferenceChange={setUseExportedForInference}
+      />
+    </div>
+  );
+}

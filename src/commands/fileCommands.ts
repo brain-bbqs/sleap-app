@@ -1,0 +1,1036 @@
+/**
+ * File commands: New, Open, Save, Export, Delete Predictions.
+ *
+ * Ports SLEAP's NewProject, OpenProject, SaveProject commands and adds
+ * CSV export, JSON save-as, prediction deletion variants, and package export.
+ */
+
+import { frameHasContent } from "@/lib/frameLabeling";
+import {
+  predictionsBeyondMaxInstances,
+  predictionsInArea,
+  predictionsInClip,
+  predictionsOnUserLabeledFrames,
+  predictionsOutsideFrameRange,
+  predictionsWithLowScore,
+  type PredictionPair,
+} from "@/lib/predictionDeletion";
+import {
+  Labels,
+  type LabeledFrame,
+  PredictedInstance,
+  Skeleton,
+  labelsToCsv,
+  saveAnalysisH5ToBytes,
+  type Video,
+} from "@talmolab/sleap-io.js";
+import { UpdateTopic } from "../types";
+import type { Command } from "./types";
+import type { CommandContext } from "./CommandContext";
+import {
+  loadProjectFromFile,
+  loadAnalysisProjectFromFile,
+  loadAnalysisProjectFromPath,
+  loadNwbProjectFromFile,
+  loadNwbProjectFromPath,
+  loadCocoProjectFromFile,
+  loadCocoProjectFromPath,
+  loadDlcFromTauriDir,
+  loadDlcFromBrowserDir,
+} from "../lib/loadProject";
+import { saveProjectAsSlp } from "../lib/saveProject";
+import { getNewVersionFilename } from "../lib/versionedFilename";
+import { confirmDiscardUnsavedWork } from "../lib/unsavedGuard";
+import { getPlatform } from "../platform/index";
+import {
+  downloadFile,
+  suggestSaveFilename,
+  generatePackageJSON,
+} from "../lib/exportUtils";
+import { toast } from "@/lib/notify";
+import { toastExported } from "@/lib/exportToast";
+import { multiSkeletonBlock } from "@/lib/multiSkeleton";
+import {
+  analysisFilename,
+  directoryOf,
+  videosForAnalysis,
+  type AnalysisFormat,
+} from "@/lib/analysisExport";
+import { chooseProjectViaHost } from "@/embed/state";
+
+/**
+ * Save text to a user-chosen location. Tauri: native save dialog + writeFile.
+ * Browser: File System Access `showSaveFilePicker` when available, else a plain
+ * download. Returns the saved path/name, or null if the user cancelled.
+ */
+async function saveTextFile(
+  content: string,
+  suggestedName: string,
+  filter: { name: string; ext: string; mime: string }
+): Promise<string | null> {
+  const platform = await getPlatform();
+
+  if (platform.isTauri) {
+    const savePath = await platform.showSaveDialog({
+      filters: [{ name: filter.name, extensions: [filter.ext] }],
+      defaultName: suggestedName,
+    });
+    if (!savePath) return null;
+    await platform.writeFile(savePath, new TextEncoder().encode(content));
+    return savePath;
+  }
+
+  if ("showSaveFilePicker" in window) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const handle = await (window as any).showSaveFilePicker({
+        suggestedName,
+        types: [
+          {
+            description: filter.name,
+            accept: { [filter.mime]: [`.${filter.ext}`] },
+          },
+        ],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(content);
+      await writable.close();
+      return handle.name as string;
+    } catch {
+      return null; // user cancelled the picker
+    }
+  }
+
+  downloadFile(content, suggestedName, filter.mime);
+  return suggestedName;
+}
+
+/**
+ * Save binary content to a user-chosen location. Tauri: native save dialog +
+ * writeFile. Browser: File System Access `showSaveFilePicker` when available,
+ * else a download. Returns the saved path/name, or null if the user cancelled.
+ */
+export async function saveBytesFile(
+  bytes: Uint8Array,
+  suggestedName: string,
+  filter: { name: string; ext: string }
+): Promise<string | null> {
+  const platform = await getPlatform();
+
+  if (platform.isTauri) {
+    const savePath = await platform.showSaveDialog({
+      filters: [{ name: filter.name, extensions: [filter.ext] }],
+      defaultName: suggestedName,
+    });
+    if (!savePath) return null;
+    await platform.writeFile(savePath, bytes);
+    return savePath;
+  }
+
+  const blob = new Blob([bytes], { type: "application/octet-stream" });
+  if ("showSaveFilePicker" in window) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const handle = await (window as any).showSaveFilePicker({
+        suggestedName,
+        types: [
+          {
+            description: filter.name,
+            accept: { "application/octet-stream": [`.${filter.ext}`] },
+          },
+        ],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return handle.name as string;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return null;
+      throw err;
+    }
+  }
+
+  downloadFile(blob, suggestedName, "application/octet-stream");
+  return suggestedName;
+}
+
+/**
+ * Write bytes to `<dir>/<name>` (Tauri only — used by batch clip export to write
+ * each clip into a single chosen destination folder without a per-file dialog).
+ */
+export async function saveBytesToDir(
+  dir: string,
+  name: string,
+  bytes: Uint8Array
+): Promise<string> {
+  const platform = await getPlatform();
+  const path = dir.replace(/[/\\]$/, "") + "/" + name;
+  await platform.writeFile(path, bytes);
+  return path;
+}
+
+/**
+ * Choose where a batch of clips should go. Tauri: pick one destination FOLDER
+ * (each clip is written into it — avoids N save dialogs). Browser: no folder
+ * write, so fall back to a per-file download for each clip.
+ */
+export async function pickClipDestination(): Promise<
+  { mode: "dir"; dir: string } | { mode: "perFile" } | { mode: "cancelled" }
+> {
+  const platform = await getPlatform();
+  if (!platform.isTauri) return { mode: "perFile" };
+  const picked = await platform.showOpenDialog({ directory: true });
+  const dir =
+    typeof picked === "string"
+      ? picked
+      : Array.isArray(picked)
+        ? ((picked[0] as string | undefined) ?? null)
+        : null;
+  return dir ? { mode: "dir", dir } : { mode: "cancelled" };
+}
+
+/** Reset state to an empty project. */
+export const NewProjectCommand: Command = {
+  name: "NewProject",
+  topics: [UpdateTopic.Project, UpdateTopic.Labels],
+  async execute(ctx: CommandContext) {
+    // Embedded: the host page picks where the project comes from (src/embed/).
+    if (chooseProjectViaHost("new")) return;
+    // Confirm discarding unsaved work (in-memory edits OR a not-yet-exported
+    // OPFS working copy) before creating a new project.
+    if (!(await confirmDiscardUnsavedWork("Creating a new project"))) return;
+
+    // Seed an empty skeleton so the editor lands in a usable state: the
+    // Skeleton panel (and its template dropdown) require a non-null skeleton —
+    // without one, New Project dead-ends on "No skeleton loaded" with no way to
+    // add nodes. With a 0-node skeleton present, the user can pick a template
+    // or add nodes, then add a video, and build a project from scratch. (#138)
+    const skeleton = new Skeleton({ nodes: [], name: "skeleton" });
+    const labels = new Labels({ skeletons: [skeleton] });
+    ctx.state.setLabels(labels, undefined);
+  },
+};
+
+/** Open a file dialog, load an SLP file, and set state. */
+export const OpenProjectCommand: Command = {
+  name: "OpenProject",
+  topics: [],
+  skipAutoSnapshot: true,
+  async execute(ctx: CommandContext) {
+    // Embedded: the host page picks the project (src/embed/).
+    if (chooseProjectViaHost("open")) return;
+    const platform = await getPlatform();
+    console.log(`[open] Opening project via ${platform.isTauri ? "Tauri" : "browser"} dialog`);
+    const result = await platform.showOpenDialog({
+      filters: [{ name: "SLEAP Labels", extensions: ["slp"] }],
+      excludeAcceptAll: true,
+    });
+
+    if (!result) return;
+
+    if (typeof result === "string") {
+      // A string path only comes back on desktop. Route through the window
+      // gate: focus the window that already has this file, load into an empty
+      // window, or spawn a new one — so opening never clobbers a loaded project
+      // and the same file never opens twice.
+      console.log(`[open] Routing open for path: ${result}`);
+      const { openOrFocusPath } = await import("@/lib/windowRouting");
+      await openOrFocusPath(result);
+    } else if (result instanceof File) {
+      console.log(`[open] Loading from File object: ${result.name} (${result.size} bytes)`);
+      await loadProjectFromFile(result);
+    }
+
+    // OpenProject sets labels directly via load helpers,
+    // so we don't need to signal topics (setLabels handles it)
+    void ctx;
+  },
+};
+
+/**
+ * Import a SLEAP Analysis HDF5 (`.analysis.h5`) file as a new project.
+ *
+ * Analysis files carry predicted points + tracks and store the source
+ * `video_path`, so the reader auto-builds the video (resolved like any external
+ * video). Filtered to `.h5` in the picker; the reader validates the contents.
+ */
+export const ImportAnalysisH5Command: Command = {
+  name: "ImportAnalysisH5",
+  topics: [],
+  skipAutoSnapshot: true,
+  async execute(ctx: CommandContext) {
+    const platform = await getPlatform();
+    const result = await platform.showOpenDialog({
+      filters: [{ name: "SLEAP Analysis HDF5", extensions: ["h5"] }],
+    });
+
+    if (!result) return;
+
+    if (typeof result === "string") {
+      await loadAnalysisProjectFromPath(result, platform.readFile, platform.exists);
+    } else if (result instanceof File) {
+      await loadAnalysisProjectFromFile(result);
+    }
+
+    void ctx;
+  },
+};
+
+/**
+ * Import an NWB (ndx-pose) predictions file (`.nwb`) as a new project.
+ *
+ * NWB predictions carry pose points + tracks and reference the source video by
+ * path (no embedded pixels), so the reader builds the video (resolved like any
+ * external video). Filtered to `.nwb` in the picker; the reader validates the
+ * contents. Opens as a new project (parity with the other importers).
+ */
+export const ImportNwbCommand: Command = {
+  name: "ImportNwb",
+  topics: [],
+  skipAutoSnapshot: true,
+  async execute(ctx: CommandContext) {
+    const platform = await getPlatform();
+    const result = await platform.showOpenDialog({
+      filters: [{ name: "NWB (ndx-pose)", extensions: ["nwb"] }],
+    });
+
+    if (!result) return;
+
+    if (typeof result === "string") {
+      await loadNwbProjectFromPath(result, platform.readFile, platform.exists);
+    } else if (result instanceof File) {
+      await loadNwbProjectFromFile(result);
+    }
+
+    void ctx;
+  },
+};
+
+/**
+ * Import a COCO keypoint-detection dataset (annotations `.json`) as a new
+ * project.
+ *
+ * COCO stores keypoints inline and references image files externally. The reader
+ * (`readCoco`) builds one image-sequence video (its frames are the dataset
+ * images) with a labeled frame per annotated image; keypoint names become the
+ * skeleton nodes. Filtered to `.json` in the picker; the loader validates that
+ * the contents are actually COCO. On desktop, images are resolved relative to
+ * the JSON file's directory; in the browser they stay unresolved (import still
+ * succeeds — the user can relocate the video afterward).
+ */
+export const ImportCocoCommand: Command = {
+  name: "ImportCoco",
+  topics: [],
+  skipAutoSnapshot: true,
+  async execute(ctx: CommandContext) {
+    const platform = await getPlatform();
+    const result = await platform.showOpenDialog({
+      filters: [{ name: "COCO Annotations", extensions: ["json"] }],
+    });
+
+    if (!result) return;
+
+    if (typeof result === "string") {
+      await loadCocoProjectFromPath(result, platform.readFile, platform.exists);
+    } else if (result instanceof File) {
+      await loadCocoProjectFromFile(result);
+    }
+
+    void ctx;
+  },
+};
+
+/** Directory of the given file path (POSIX or Windows separators). */
+function parentDir(p: string): string {
+  const cut = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  return cut > 0 ? p.slice(0, cut) : p;
+}
+
+/**
+ * Browser directory picker (File System Access API). Returns the chosen
+ * directory handle, or null if unavailable or cancelled. DLC datasets are file
+ * trees, so the browser must pick a folder (a single-file pick can't reach
+ * sibling images/config); Tauri uses the native file/dir dialog instead.
+ */
+async function pickBrowserDlcDir(): Promise<unknown | null> {
+  if (typeof window === "undefined" || !("showDirectoryPicker" in window)) {
+    toast.error("Folder picker not available in this browser", {
+      description:
+        "DeepLabCut import needs the File System Access API (Chrome/Edge), " +
+        "or use the desktop app.",
+    });
+    return null;
+  }
+  try {
+    return await (
+      window as unknown as {
+        showDirectoryPicker: (o?: unknown) => Promise<unknown>;
+      }
+    ).showDirectoryPicker({ id: "sleap-import-dlc", mode: "read" });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") return null;
+    throw err;
+  }
+}
+
+/**
+ * Import a single DeepLabCut dataset (File > Import > DeepLabCut dataset...).
+ * Tauri: pick a `.csv` or `config.yaml` and import its folder (a `config.yaml`
+ * imports the whole project; a bare CSV imports that dataset). Browser: pick the
+ * dataset/project folder (File System Access API).
+ */
+export const ImportDlcCommand: Command = {
+  name: "ImportDlc",
+  topics: [],
+  skipAutoSnapshot: true,
+  async execute(ctx: CommandContext) {
+    const platform = await getPlatform();
+    if (platform.isTauri) {
+      const result = await platform.showOpenDialog({
+        filters: [{ name: "DeepLabCut dataset", extensions: ["yaml", "csv"] }],
+      });
+      if (typeof result !== "string") return;
+      // Enumerate the picked file's folder, but import exactly what was picked
+      // (a config .yaml → its project; a .csv → that dataset).
+      await loadDlcFromTauriDir(
+        parentDir(result),
+        "single",
+        platform.readFile,
+        platform.exists,
+        result
+      );
+    } else {
+      const dir = await pickBrowserDlcDir();
+      if (!dir) return;
+      await loadDlcFromBrowserDir(dir, "single");
+    }
+    void ctx;
+  },
+};
+
+/**
+ * Import many DeepLabCut datasets from a parent folder, merged into one project
+ * (File > Import > Multiple DeepLabCut datasets from folder...). Loads every
+ * dataset CSV one folder deep and unifies them (matches PyQt SLEAP).
+ */
+export const ImportDlcFolderCommand: Command = {
+  name: "ImportDlcFolder",
+  topics: [],
+  skipAutoSnapshot: true,
+  async execute(ctx: CommandContext) {
+    const platform = await getPlatform();
+    if (platform.isTauri) {
+      const result = await platform.showOpenDialog({ directory: true });
+      if (typeof result !== "string") return;
+      await loadDlcFromTauriDir(
+        result,
+        "folder",
+        platform.readFile,
+        platform.exists
+      );
+    } else {
+      const dir = await pickBrowserDlcDir();
+      if (!dir) return;
+      await loadDlcFromBrowserDir(dir, "folder");
+    }
+    void ctx;
+  },
+};
+
+/**
+ * Seed name for a never-saved project. PyQt SLEAP seeds `labels.v000.slp` and
+ * increments it on first save, so the first proposed name is `labels.v001.slp`.
+ */
+const NEW_PROJECT_VERSION_SEED = "labels.v000.slp";
+
+/**
+ * Save the project as SLP (HDF5).
+ *
+ * A named project overwrites in place (no version bump) — matching PyQt's Save.
+ * An untitled project has never been written, so we propose the seeded first
+ * version (labels.v001.slp) in the save dialog.
+ */
+export const SaveProjectCommand: Command = {
+  name: "SaveProject",
+  topics: [],
+  async execute(ctx: CommandContext) {
+    const { labels, filename } = ctx.state;
+    if (!labels) return;
+    const hint = filename ?? getNewVersionFilename(NEW_PROJECT_VERSION_SEED);
+    await saveProjectAsSlp(labels, hint);
+  },
+};
+
+/**
+ * Save the project as SLP, always showing the file picker with the NEXT version
+ * pre-filled (PyQt's Save As → get_new_version_filename).
+ */
+export const SaveAsProjectCommand: Command = {
+  name: "SaveAsProject",
+  topics: [],
+  async execute(ctx: CommandContext) {
+    const { labels, filename } = ctx.state;
+    if (!labels) return;
+    const hint = getNewVersionFilename(filename ?? NEW_PROJECT_VERSION_SEED);
+    await saveProjectAsSlp(labels, hint, true);
+  },
+};
+
+/** Export the current project as JSON (toDict() serialization). */
+export const ExportJsonCommand: Command = {
+  name: "ExportJson",
+  topics: [],
+  async execute(ctx: CommandContext) {
+    const { labels, filename } = ctx.state;
+    if (!labels) return;
+
+    try {
+      const dict = labels.toDict();
+      const json = JSON.stringify(dict, null, 2);
+      const baseName = filename
+        ? filename.replace(/\.slp$/, "")
+        : "labels";
+      const saved = await saveTextFile(json, `${baseName}.json`, {
+        name: "JSON",
+        ext: "json",
+        mime: "application/json",
+      });
+      if (!saved) return; // user cancelled
+      toast.success("JSON exported", { description: saved });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error("Failed to export JSON", { description: msg });
+      console.error("[ExportJson] Failed to export:", err);
+    }
+  },
+};
+
+/**
+ * Export analysis files (SLEAP Analysis HDF5 or CSV), as PyQt SLEAP's
+ * File → Export Analysis HDF5/CSV → Current Video / All Videos: one file per
+ * video with labeled frames, named `{project}.{index:03}_{video}.analysis.{ext}`.
+ * A single file gets a Save dialog (in the project's folder on desktop); several
+ * go into one chosen folder on desktop, or download one by one in the browser.
+ */
+async function exportAnalysisFiles(
+  ctx: CommandContext,
+  format: AnalysisFormat,
+  allVideos: boolean,
+  includeEmpty: boolean
+): Promise<void> {
+  const { labels, filename } = ctx.state;
+  if (!labels) return;
+  // sleap-io.js lays analysis arrays out on skeletons[0] (as Python's analysis
+  // writer uses the single-skeleton accessor): refuse rather than mis-export.
+  if (multiSkeletonBlock(labels, "Exporting analysis files")) return;
+  const kind = format === "h5" ? "Analysis HDF5" : "Analysis CSV";
+  if (labels.labeledFrames.length === 0) {
+    toast.info("No labeled frames in project. Nothing to export.");
+    return;
+  }
+  const videos = videosForAnalysis(labels, ctx.state.video, allVideos);
+  if (videos.length === 0) {
+    toast.info("No labeled frames in the video(s). Nothing to export.");
+    return;
+  }
+
+  const projectPath = ctx.state.projectPath;
+  const labelsPath = projectPath ?? filename ?? undefined;
+  const fileFor = async (video: Video) => {
+    const name = analysisFilename(filename, labels, video, format);
+    const bytes =
+      format === "h5"
+        ? await saveAnalysisH5ToBytes(labels, { video, labelsPath })
+        : new TextEncoder().encode(labelsToCsv(labels, { video, includeEmpty }));
+    return { name, bytes };
+  };
+  const filter =
+    format === "h5"
+      ? { name: "SLEAP Analysis HDF5", ext: "h5" }
+      : { name: "CSV", ext: "csv" };
+
+  try {
+    const platform = await getPlatform();
+    if (videos.length === 1) {
+      const { name, bytes } = await fileFor(videos[0]);
+      const dir = platform.isTauri ? directoryOf(projectPath) : null;
+      const saved = await saveBytesFile(bytes, dir ? `${dir}/${name}` : name, filter);
+      if (!saved) return; // user cancelled
+      toastExported(`${kind} exported`, saved, platform.isTauri);
+      return;
+    }
+
+    const dest = await pickClipDestination();
+    if (dest.mode === "cancelled") return;
+    for (const video of videos) {
+      const { name, bytes } = await fileFor(video);
+      if (dest.mode === "dir") {
+        await saveBytesToDir(dest.dir, name, bytes);
+      } else {
+        downloadFile(new Blob([bytes as BlobPart]), name, "application/octet-stream");
+      }
+    }
+    const where = dest.mode === "dir" ? dest.dir : "your downloads";
+    toastExported(`${kind}: exported ${videos.length} files`, where, dest.mode === "dir");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    toast.error(`Failed to export ${kind}`, { description: msg });
+    console.error(`[ExportAnalysis] Failed to export ${format}:`, err);
+  }
+}
+
+/**
+ * Export SLEAP Analysis CSV via sleap-io's canonical `labelsToCsv` (wide
+ * format: one row per animal per frame (a user instance replaces the prediction it was made from; hidden nodes are empty), alphabetical `{node}.x/.y/.score`
+ * columns), one file per video — parity with Python SLEAP's analysis CSV.
+ * `params.allVideos` exports every video with labeled frames (PyQt's
+ * "All Videos..."); otherwise the current video. `params.includeEmpty`
+ * (default true) pads each video to its full span with NaN rows.
+ */
+export const ExportCSVCommand: Command = {
+  name: "ExportCSV",
+  topics: [],
+  async execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    await exportAnalysisFiles(
+      ctx,
+      "csv",
+      params?.allVideos === true,
+      params?.includeEmpty !== false
+    );
+  },
+};
+
+/**
+ * Export SLEAP Analysis HDF5 (.h5) — the dense-array format for downstream
+ * analysis (Python/MATLAB) — via sleap-io's browser-safe
+ * `saveAnalysisH5ToBytes`, one file per video. `params.allVideos` exports every
+ * video with labeled frames (PyQt's "All Videos..."); otherwise the current
+ * video ("Current Video...").
+ */
+export const ExportAnalysisH5Command: Command = {
+  name: "ExportAnalysisH5",
+  topics: [],
+  async execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    await exportAnalysisFiles(ctx, "h5", params?.allVideos === true, true);
+  },
+};
+
+/** Save the project as JSON with a file picker and version numbering. */
+export const SaveAsJsonCommand: Command = {
+  name: "SaveAsJson",
+  topics: [],
+  async execute(ctx: CommandContext) {
+    const { labels, filename } = ctx.state;
+    if (!labels) return;
+
+    try {
+      const dict = labels.toDict();
+      const json = JSON.stringify(dict, null, 2);
+      const suggestedName = suggestSaveFilename(filename);
+      const saved = await saveTextFile(json, suggestedName, {
+        name: "JSON",
+        ext: "json",
+        mime: "application/json",
+      });
+      if (!saved) return; // user cancelled
+      ctx.state.clearChanges();
+      toast.success("JSON saved", { description: saved });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error("Failed to save JSON", { description: msg });
+      console.error("[SaveAsJson] Failed to save:", err);
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Delete Prediction Variants
+//
+// Scopes match PyQt SLEAP's commands of the same name (#463); the selectors in
+// `lib/predictionDeletion.ts` decide what goes. Only predictions are deleted,
+// never user instances, and frames that still hold something afterwards (a
+// negative mark, an annotation) are kept.
+// ---------------------------------------------------------------------------
+
+/**
+ * Delete the given (frame, prediction) pairs in one pass, as one undo step.
+ * Drops only the frames this deletion left with nothing in them. Returns how
+ * many were deleted (0 means nothing changed and no undo step was pushed).
+ */
+function deletePredictionPairs(
+  ctx: CommandContext,
+  commandName: string,
+  pairs: PredictionPair[],
+): number {
+  const { labels, instance } = ctx.state;
+  if (!labels || pairs.length === 0) return 0;
+
+  const snapshot = ctx.takeAllFramesSnapshot(commandName);
+
+  const byFrame = new Map<LabeledFrame, Set<PredictedInstance>>();
+  for (const [lf, p] of pairs) {
+    let set = byFrame.get(lf);
+    if (!set) byFrame.set(lf, (set = new Set()));
+    set.add(p);
+  }
+
+  let removed = 0;
+  const emptied = new Set<LabeledFrame>();
+  for (const [lf, doomed] of byFrame) {
+    const before = lf.instances.length;
+    lf.instances = lf.instances.filter(
+      (inst) => !(inst instanceof PredictedInstance && doomed.has(inst)),
+    );
+    removed += before - lf.instances.length;
+    if (!frameHasContent(lf)) emptied.add(lf);
+  }
+  if (emptied.size > 0) {
+    labels.labeledFrames = labels.labeledFrames.filter((lf) => !emptied.has(lf));
+  }
+
+  ctx.pushUndoSnapshot(snapshot);
+
+  if (
+    instance instanceof PredictedInstance &&
+    [...byFrame.values()].some((s) => s.has(instance))
+  ) {
+    ctx.state.setInstance(null);
+  }
+  ctx.state.markChanged();
+  return removed;
+}
+
+function numParam(
+  params: Record<string, unknown> | undefined,
+  key: string,
+  fallback: number,
+): number {
+  const v = params?.[key];
+  return typeof v === "number" ? v : fallback;
+}
+
+/** Delete predictions in the current video with a score below a threshold. */
+export const DeletePredictionsByScore: Command = {
+  name: "DeletePredictionsByScore",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video } = ctx.state;
+    if (!labels || !video) return;
+    const threshold = numParam(params, "threshold", 0.5);
+
+    const removed = deletePredictionPairs(
+      ctx,
+      "DeletePredictionsByScore",
+      predictionsWithLowScore(labels, video, threshold),
+    );
+    if (removed === 0) {
+      toast.info("No predictions in this video scored below the threshold.");
+      return;
+    }
+    toast.success(`Deleted ${removed} prediction(s) in this video`, {
+      description: `Score below ${threshold}`,
+    });
+  },
+};
+
+/**
+ * Delete predictions in the current video **outside** a frame range
+ * (`startFrame`..`endFrame`, 0-based, inclusive): the range is what to keep.
+ * PyQt's "Delete Predictions Outside Frame Range...". Other videos are left
+ * alone, since their frame numbers don't line up with this one's.
+ */
+export const DeletePredictionsByRange: Command = {
+  name: "DeletePredictionsByRange",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video } = ctx.state;
+    if (!labels || !video) return;
+    const startFrame = numParam(params, "startFrame", 0);
+    const endFrame = numParam(params, "endFrame", Infinity);
+    // A reversed range keeps nothing; refuse it rather than wipe the video.
+    if (!(startFrame <= endFrame)) {
+      toast.info("The frame range is empty: the start is after the end.");
+      return;
+    }
+
+    const removed = deletePredictionPairs(
+      ctx,
+      "DeletePredictionsByRange",
+      predictionsOutsideFrameRange(labels, video, startFrame, endFrame),
+    );
+    if (removed === 0) {
+      toast.info("No predictions in this video outside the frame range.");
+      return;
+    }
+    toast.success(`Deleted ${removed} prediction(s) in this video`, {
+      description: `Outside frames ${startFrame} to ${endFrame}`,
+    });
+  },
+};
+
+/**
+ * Delete predictions in the clip selected on the seekbar (current video).
+ * `startFrame`/`endFrame` (0-based, inclusive) default to that selection.
+ * PyQt's "Delete Predictions from Clip...".
+ */
+export const DeletePredictionsFromClip: Command = {
+  name: "DeletePredictionsFromClip",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video, frameRange } = ctx.state;
+    if (!labels || !video) return;
+    const startFrame = numParam(params, "startFrame", frameRange?.[0] ?? NaN);
+    const endFrame = numParam(params, "endFrame", frameRange?.[1] ?? NaN);
+    if (!Number.isFinite(startFrame) || !Number.isFinite(endFrame)) {
+      toast.info("Select a clip first: shift-drag on the seekbar.");
+      return;
+    }
+
+    const removed = deletePredictionPairs(
+      ctx,
+      "DeletePredictionsFromClip",
+      predictionsInClip(labels, video, startFrame, endFrame),
+    );
+    if (removed === 0) {
+      toast.info("No predictions in the selected clip.");
+      return;
+    }
+    toast.success(`Deleted ${removed} prediction(s) from the clip`, {
+      description: `Frames ${startFrame} to ${endFrame} of this video`,
+    });
+  },
+};
+
+/**
+ * Delete predictions on frames that also have user instances. PyQt's
+ * "Delete Predictions on User-Labeled Frames...": `allVideos` (default false:
+ * current video only) and `unlinkedOnly` (default true: keep the prediction a
+ * user instance was made from).
+ */
+export const DeletePredictionsOnLabeledFrames: Command = {
+  name: "DeletePredictionsOnLabeledFrames",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video } = ctx.state;
+    if (!labels) return;
+    const allVideos = params?.allVideos === true;
+    const unlinkedOnly = params?.unlinkedOnly !== false;
+    if (!allVideos && !video) return;
+
+    const removed = deletePredictionPairs(
+      ctx,
+      "DeletePredictionsOnLabeledFrames",
+      predictionsOnUserLabeledFrames(labels, allVideos ? null : video, unlinkedOnly),
+    );
+    const where = allVideos ? "in all videos" : "in this video";
+    if (removed === 0) {
+      toast.info(`No predictions to delete on user-labeled frames ${where}.`);
+      return;
+    }
+    toast.success(`Deleted ${removed} prediction(s) ${where}`, {
+      description: unlinkedOnly
+        ? "Unlinked predictions on user-labeled frames"
+        : "All predictions on user-labeled frames",
+    });
+  },
+};
+
+/** Keep only the top N predictions (by score) on each frame of the current video. */
+export const DeletePredictionsByMaxCount: Command = {
+  name: "DeletePredictionsByMaxCount",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video } = ctx.state;
+    if (!labels || !video) return;
+    const maxInstances = numParam(params, "maxInstances", 2);
+
+    const removed = deletePredictionPairs(
+      ctx,
+      "DeletePredictionsByMaxCount",
+      predictionsBeyondMaxInstances(labels, video, maxInstances),
+    );
+    if (removed === 0) {
+      toast.info("No frame in this video has more predictions than the maximum.");
+      return;
+    }
+    toast.success(`Deleted ${removed} prediction(s) in this video`, {
+      description: `Kept the top ${maxInstances} per frame`,
+    });
+  },
+};
+
+/**
+ * Delete predictions whose visible points all lie inside a box
+ * (`x1,y1`–`x2,y2`, image coordinates) on **every frame of the current
+ * video** — for static false detections such as a reflection. PyQt's
+ * "Delete Predictions from Area...".
+ */
+export const DeletePredictionsByArea: Command = {
+  name: "DeletePredictionsByArea",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video } = ctx.state;
+    if (!labels || !video) return;
+    const box = {
+      x1: numParam(params, "x1", 0),
+      y1: numParam(params, "y1", 0),
+      x2: numParam(params, "x2", 0),
+      y2: numParam(params, "y2", 0),
+    };
+    if (box.x1 === box.x2 || box.y1 === box.y2) return;
+
+    const removed = deletePredictionPairs(
+      ctx,
+      "DeletePredictionsByArea",
+      predictionsInArea(labels, video, box),
+    );
+    if (removed === 0) {
+      toast.info("No predictions in this video lie inside the selected area.");
+      return;
+    }
+    toast.success(`Deleted ${removed} prediction(s) in this video`, {
+      description: "Inside the selected area, on every frame",
+    });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Delete Predictions by Track
+// ---------------------------------------------------------------------------
+
+/** Delete predicted instances on a specific track (or untracked). */
+export const DeletePredictionsByTrack: Command = {
+  name: "DeletePredictionsByTrack",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, instance } = ctx.state;
+    if (!labels) return;
+
+    // trackName: string | null (null means untracked)
+    const trackName = params?.trackName as string | null | undefined;
+
+    const snapshot = ctx.takeAllFramesSnapshot("DeletePredictionsByTrack");
+    let removed = 0;
+
+    for (const lf of labels.labeledFrames) {
+      const before = lf.instances.length;
+      lf.instances = lf.instances.filter((inst) => {
+        if (!(inst instanceof PredictedInstance)) return true;
+        if (trackName === null || trackName === undefined) {
+          // Delete untracked
+          return inst.track !== null;
+        }
+        return inst.track?.name !== trackName;
+      });
+      removed += before - lf.instances.length;
+    }
+
+    labels.labeledFrames = labels.labeledFrames.filter(frameHasContent);
+
+    if (removed === 0) {
+      toast.info("No predictions matched the track filter.");
+      return;
+    }
+
+    ctx.pushUndoSnapshot(snapshot);
+
+    if (instance && instance instanceof PredictedInstance) {
+      ctx.state.setInstance(null);
+    }
+    ctx.state.markChanged();
+    toast.success(`Deleted ${removed} prediction(s)`, {
+      description: trackName ? `Track: ${trackName}` : "Untracked instances",
+    });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Delete Instances by Type
+// ---------------------------------------------------------------------------
+
+/** Delete instances by type: "predicted", "user", or "all". */
+export const DeleteInstancesByType: Command = {
+  name: "DeleteInstancesByType",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, instance } = ctx.state;
+    if (!labels) return;
+
+    const instanceType = (params?.instanceType as string) ?? "predicted";
+
+    const snapshot = ctx.takeAllFramesSnapshot("DeleteInstancesByType");
+    let removed = 0;
+
+    for (const lf of labels.labeledFrames) {
+      const before = lf.instances.length;
+      lf.instances = lf.instances.filter((inst) => {
+        if (instanceType === "predicted") {
+          return !(inst instanceof PredictedInstance);
+        } else if (instanceType === "user") {
+          return inst instanceof PredictedInstance;
+        } else {
+          // "all" — remove everything
+          return false;
+        }
+      });
+      removed += before - lf.instances.length;
+    }
+
+    labels.labeledFrames = labels.labeledFrames.filter(frameHasContent);
+
+    if (removed === 0) {
+      toast.info("No instances matched the type filter.");
+      return;
+    }
+
+    ctx.pushUndoSnapshot(snapshot);
+
+    if (instance) {
+      ctx.state.setInstance(null);
+    }
+    ctx.state.markChanged();
+    toast.success(`Deleted ${removed} instance(s)`, {
+      description: `Type: ${instanceType}`,
+    });
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Export Package
+// ---------------------------------------------------------------------------
+
+/** Export a self-contained labels package as JSON (`.pkg.json`). */
+export const ExportPackageCommand: Command = {
+  name: "ExportPackage",
+  topics: [],
+  async execute(ctx: CommandContext) {
+    const { labels, filename } = ctx.state;
+    if (!labels) return;
+
+    try {
+      const packageJson = generatePackageJSON(labels);
+      const baseName = filename
+        ? filename.replace(/\.slp$/, "").replace(/\.json$/, "")
+        : "labels";
+      const saved = await saveTextFile(packageJson, `${baseName}.pkg.json`, {
+        name: "JSON Package",
+        ext: "json",
+        mime: "application/json",
+      });
+      if (!saved) return; // user cancelled
+      toast.success("Package exported", { description: saved });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error("Failed to export package", { description: msg });
+      console.error("[ExportPackage] Failed to export:", err);
+    }
+  },
+};

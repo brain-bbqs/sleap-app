@@ -1,0 +1,1595 @@
+/**
+ * Frame navigation seekbar component.
+ *
+ * Matches SLEAP's VideoSlider with:
+ * - Frame scrubbing (click and drag)
+ * - Marks for labeled frames (colored dots)
+ * - Track occupancy bars
+ * - Frame counter display
+ * - Selection range (Shift+click-drag)
+ * - Instance count header graph
+ */
+
+import {
+  useRef,
+  useCallback,
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useDeferredValue,
+} from "react";
+import { useAppStore } from "../../stores/appStore";
+import { getTrackColor, rgbToCSS } from "../../lib/colorPalettes";
+import { getActiveTrackOverrides } from "../../lib/trackColorOverrides";
+import {
+  computeStatisticSeries,
+  getGraphSpec,
+  GRAPH_SPECS,
+  reconcileReduction,
+  type StatisticGraphType,
+} from "@/lib/statisticSeries";
+import type {
+  WorkerGraphType,
+  WorkerRequest,
+  WorkerResponse,
+} from "@/lib/statisticSeriesWorkerCore";
+import {
+  drawHeaderSeries,
+  frameTickInterval,
+  HEADER_FILL,
+} from "@/lib/headerSeriesRender";
+import {
+  resizeHeaderHeight,
+  resizeTracksHeight,
+  effectiveTracksHeight,
+  tracksLaneMetrics,
+  TRACKS_LANE_GAP_PX,
+  TRACKS_MIN_HEIGHT,
+  TRACKS_TOP_PAD_PX,
+} from "@/lib/seekbarHeaderHeight";
+import { inferFrameCount } from "@/lib/inferFrameCount";
+import { isFastScrub, FAST_SCRUB_FRAMES_PER_TICK } from "@/lib/videoPrefetch";
+import { isUserLabeledFrame } from "@/lib/frameLabeling";
+import { frameHoverInfo } from "@/lib/seekbarHoverInfo";
+import { nearestFrameInDomain } from "@/lib/navigableFrames";
+import { cachedNavigableDomain } from "@/lib/navigationDomainCache";
+import {
+  createSeriesCache,
+  getOrComputeSeries,
+  peekSeries,
+  putSeries,
+} from "@/lib/seriesCache";
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
+  SkipBack,
+  ChevronLeft,
+  Play,
+  Pause,
+  ChevronRight,
+  SkipForward,
+  List,
+  ListFilter,
+  Images,
+  Lightbulb,
+} from "lucide-react";
+
+/** Playback speed presets. */
+const PLAYBACK_SPEEDS = [0.25, 0.5, 1, 2, 4, 8];
+
+/** Snap threshold in pixels for snapping to labeled frames. */
+const SNAP_THRESHOLD_PX = 12;
+
+/**
+ * Frame-count threshold past which the 3 heavy header graphs (point
+ * displacement, primary point displacement, min centroid proximity) are
+ * computed off the main thread in a Web Worker. Smaller videos keep the
+ * synchronous useMemo path. Locked default; tune empirically.
+ */
+const WORKER_FRAME_THRESHOLD = 2000;
+
+/** The heavy graph types that have a Web Worker implementation. */
+const WORKER_GRAPHS: ReadonlySet<StatisticGraphType> = new Set<StatisticGraphType>([
+  "point-displacement",
+  "primary-point-displacement",
+  "min-centroid-proximity",
+]);
+
+/**
+ * Height (px) of the ruler strip at the top of the main bar: the frame
+ * numbers live there, so the markers below never run over them.
+ */
+const RULER_PX = 16;
+
+/** The ruler strip's fill (the bar below it is #27272a, Tailwind zinc-800). */
+const RULER_FILL = "#1f1f23";
+
+/** The suggestion flags: small down-triangles on the top edge of the bar. */
+const SUGGESTION_FLAG_HALF_WIDTH_PX = 3;
+const SUGGESTION_FLAG_HEIGHT_PX = 4;
+
+/**
+ * Draw frame-index gridlines onto the header canvas every N frames (PyQt-style
+ * ticks — see frameTickInterval), lined up with the main bar's. No numbers:
+ * the main bar right below has them, and a second row only cluttered the graph.
+ */
+function drawHeaderFrameMarkers(
+  ctx: CanvasRenderingContext2D,
+  totalFrames: number,
+  w: number,
+  h: number,
+): void {
+  if (totalFrames <= 1) return;
+  drawFrameGridlines(ctx, totalFrames, w, h);
+}
+
+/**
+ * The ruler strip along the top of the main bar: a slightly darker band with
+ * the frame numbers, just right of each gridline, at the size the header used
+ * to show them. Fewer numbers on longer videos (frameTickInterval). A label
+ * that would run off the right edge is skipped.
+ */
+function drawBarRuler(
+  ctx: CanvasRenderingContext2D,
+  totalFrames: number,
+  w: number,
+): void {
+  ctx.fillStyle = RULER_FILL;
+  ctx.fillRect(0, 0, w, RULER_PX);
+  if (totalFrames <= 1) return;
+  const step = frameTickInterval(totalFrames);
+  ctx.save();
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "rgba(255, 255, 255, 0.7)";
+  for (let f = step; f < totalFrames; f += step) {
+    const x = (f / (totalFrames - 1)) * w + 3;
+    const label = String(f);
+    if (x + ctx.measureText(label).width > w) continue;
+    ctx.fillText(label, x, 1);
+  }
+  ctx.restore();
+}
+
+/**
+ * Subtle full-height grey verticals every N frames (see frameTickInterval).
+ * Shared by the header and the main bar so their gridlines line up.
+ */
+function drawFrameGridlines(
+  ctx: CanvasRenderingContext2D,
+  totalFrames: number,
+  w: number,
+  h: number,
+): void {
+  if (totalFrames <= 1) return;
+  const step = frameTickInterval(totalFrames);
+  ctx.save();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
+  ctx.beginPath();
+  for (let f = step; f < totalFrames; f += step) {
+    const x = (f / (totalFrames - 1)) * w;
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * Draw a minimal Y-axis scale (the graph's max at the top of the plot band, min
+ * at the baseline) on the left edge, so the height has a readable scale. Only
+ * when the header is tall enough to fit the labels without crowding the graph.
+ */
+function drawHeaderYScale(
+  ctx: CanvasRenderingContext2D,
+  min: number,
+  max: number,
+  h: number,
+  topPad: number,
+): void {
+  if (h < 44) return;
+  const fmt = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+  ctx.save();
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.fillStyle = "rgba(255, 255, 255, 0.55)";
+  ctx.textBaseline = "top";
+  ctx.fillText(fmt(max), 3, topPad + 2);
+  ctx.textBaseline = "bottom";
+  ctx.fillText(fmt(min), 3, h - 2);
+  ctx.restore();
+}
+
+export function Seekbar() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const headerCanvasRef = useRef<HTMLCanvasElement>(null);
+  const tracksCanvasRef = useRef<HTMLCanvasElement>(null);
+  const tracksContainerRef = useRef<HTMLDivElement>(null);
+  const tracksLaneHeightRef = useRef(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const headerContainerRef = useRef<HTMLDivElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+
+  const video = useAppStore((s) => s.video);
+  const frameIdx = useAppStore((s) => s.frameIdx);
+  const labels = useAppStore((s) => s.labels);
+  const palette = useAppStore((s) => s.palette);
+  const trackColorOverrides = useAppStore((s) =>
+    getActiveTrackOverrides(s.trackColorOverrides, s.projectPath, s.filename),
+  );
+  const setFrameIdx = useAppStore((s) => s.setFrameIdx);
+  const frameRange = useAppStore((s) => s.frameRange);
+  const markedFrame = useAppStore((s) => s.markedFrame);
+  const seekbarHeaderGraph = useAppStore((s) => s.seekbarHeaderGraph);
+  const seekbarHeaderReduction = useAppStore((s) => s.seekbarHeaderReduction);
+  const seekbarHeaderHeight = useAppStore((s) => s.seekbarHeaderHeight);
+  const seekbarTracksHeight = useAppStore((s) => s.seekbarTracksHeight);
+  // When the sidebar is on the left, the transport controls + header graph
+  // picker move left too. We reorder via `order` (grid auto-flow) rather than an
+  // explicit `col-start`: WebKit (the desktop WKWebView) mis-sizes an `auto`
+  // subgrid track fed by a col-start child, which made the controls vanish on
+  // the left (#278). Auto-flow + order matches the original working mechanism,
+  // and the canvas stays in the wide 1fr column so header/seekbar stay aligned.
+  const sidebarOnLeft = useAppStore((s) => s.sidebarSide) === "left";
+  const controlsOrder = sidebarOnLeft ? "order-first" : "";
+  const overlayVersion = useAppStore((s) => s.overlayVersion);
+  // The header-graph series + labeled-frame marks are derived from label CONTENT,
+  // so they key on the edit counter, NOT `overlayVersion` (which bumps every rAF
+  // to drive the overlay repaint — keying on that re-extracted every frame and
+  // blanked the graph mid-drag). `rawEditSeq` bumps once per edit (#329 defers it
+  // to a single bump per drag gesture, on release).
+  const rawEditSeq = useAppStore((s) => s.editSeq);
+  // Debounced further: rebuild the (whole-project) header series/marks only after
+  // edits SETTLE, so a burst of drags triggers one rebuild when you pause, not one
+  // per release. The header rarely needs to reflect the latest edit instantly;
+  // ~0.8s stale is fine (and closer to how PyQt lazily refreshes it). Every
+  // `editSeq` consumer below (series builds + headerData) uses this debounced copy.
+  const [editSeq, setEditSeq] = useState(rawEditSeq);
+  useEffect(() => {
+    const t = setTimeout(() => setEditSeq(rawEditSeq), 800);
+    return () => clearTimeout(t);
+  }, [rawEditSeq]);
+  const videoRevision = useAppStore((s) => s.videoRevision);
+  const setKey = useAppStore((s) => s.set);
+  const navigationDomain = useAppStore((s) => s.navigationDomain);
+  const cycleNavigationDomain = useAppStore((s) => s.cycleNavigationDomain);
+
+  // Playback state — lifted into the store so any seek source (keyboard nav,
+  // transport buttons) can pause playback (rule #3) and VideoPlayer can gate
+  // decode-ahead on it. Speed stays local (UI-only).
+  const isPlaying = useAppStore((s) => s.isPlaying);
+  const togglePlay = useAppStore((s) => s.togglePlay);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const animFrameRef = useRef<number>(0);
+  const lastTimeRef = useRef<number>(0);
+
+  // Range selection state
+  const [isSelectingRange, setIsSelectingRange] = useState(false);
+  const [rangeAnchor, setRangeAnchor] = useState<number | null>(null);
+  // Bumped on window resize so canvas effects that DON'T depend on frameIdx —
+  // notably the header frame-markers — recompute their DPR-scaled backing store
+  // at the new width; otherwise the header alone goes blurry after a resize.
+  const [resizeTick, setResizeTick] = useState(0);
+
+  // Assumed FPS for playback (30 fps default)
+  const fps = 30;
+
+  // Use video shape if available, otherwise infer from labeled frames.
+  // videoRevision is a dep so a deferred backend opening (which corrects
+  // video.shape[0] to the true source count) re-extends the seekbar.
+  const shapeFrames = useMemo(
+    () => video?.shape?.[0] ?? null,
+    [video, videoRevision]
+  );
+  // Fallback length only when the video's own frame count is unknown. Guarded
+  // by `shapeFrames == null` so a known-length video (the common case) skips the
+  // whole-project scan entirely — it used to run on EVERY render (incl. every
+  // node-drag tick via overlayVersion) and then get discarded, stalling drags on
+  // many-thousand-frame projects.
+  const inferredFrames = shapeFrames == null ? inferFrameCount(labels, video) : 0;
+  const totalFrames = shapeFrames ?? (inferredFrames > 0 ? inferredFrames : 0);
+
+  // The active navigation domain (#137) for the current video, used to snap
+  // seekbar clicks/drag in labeled/imaged mode. `null` (no restriction) is
+  // coerced to `[]`. Keyed on `rawEditSeq` (the immediate edit counter), NOT
+  // `overlayVersion`: the labeled set only changes on an edit, and snapping is
+  // interactive so it must reflect the latest edit at once (unlike the header
+  // series, which can lag on the debounced `editSeq`). This also drops the
+  // per-drag-tick rescan overlayVersion used to trigger. The cache reuses one
+  // scan across the store's `incrementFrameIdx` and the nav commands.
+  const domainIndices = useMemo(
+    () => cachedNavigableDomain(labels, video, navigationDomain, rawEditSeq) ?? [],
+    [labels, video, navigationDomain, rawEditSeq]
+  );
+  // Confined navigation is active only when a concrete domain exists to visit.
+  const isConfined = navigationDomain !== "all" && domainIndices.length > 0;
+
+  // A video is "unavailable" when it has no backend and no embedded images
+  // (e.g. an unresolved/missing external video) — no frame can be shown at all.
+  const videoUnavailable =
+    !!video && video.backend === null && !video.hasEmbeddedImages;
+
+  // Tooltip for the transport mode button. The button stays visible and
+  // cycleable in every mode; when a confined mode has nothing to visit it's
+  // inert (navigation falls through to dense), and the tooltip says why so the
+  // no-op is honest rather than silent.
+  const navModeTooltip =
+    navigationDomain === "all"
+      ? "Navigate: all frames"
+      : navigationDomain === "labeled"
+        ? domainIndices.length === 0
+          ? "Navigate: labeled frames only — none in this video yet"
+          : "Navigate: labeled frames only"
+        : navigationDomain === "suggested"
+          ? domainIndices.length === 0
+            ? "Navigate: suggested frames only — none in this video yet"
+            : "Navigate: suggested frames only"
+        : domainIndices.length === 0
+          ? videoUnavailable
+            ? "Navigate: imaged frames only — no video available"
+            : video?.hasEmbeddedImages
+              ? "Navigate: imaged frames only — no embedded frames"
+              : "Navigate: imaged frames only — all frames have images"
+          : "Navigate: imaged frames only";
+
+  // Whether the selected graph is a heavy graph offloaded to the worker. Only
+  // gated past the frame threshold; below it the synchronous path is fine.
+  const useWorker =
+    WORKER_GRAPHS.has(seekbarHeaderGraph) && totalFrames > WORKER_FRAME_THRESHOLD;
+
+  // Per-(video, graph, reduction) result cache so re-selecting a graph is
+  // instant (issue #105 AC2). Invalidated on video change / label edit
+  // (overlayVersion) inside the cache helper, so it never serves stale data.
+  const seriesCacheRef = useRef(createSeriesCache());
+
+  // Synchronously-computed header statistic series for the selected graph type.
+  // "none" and "instance-count" are drawn directly in the header effect and
+  // return null here. Heavy graphs over the worker threshold also return null
+  // (computed off-thread; see the worker effect below). overlayVersion is
+  // intentionally in the deps so the series refreshes after labeling edits.
+  const syncHeaderSeries = useMemo<Map<number, number> | null>(() => {
+    if (!labels || !video) return null;
+    if (seekbarHeaderGraph === "none" || seekbarHeaderGraph === "instance-count") {
+      return null;
+    }
+    if (useWorker) return null;
+    return getOrComputeSeries(
+      seriesCacheRef.current,
+      video,
+      editSeq,
+      `${seekbarHeaderGraph}|${seekbarHeaderReduction}`,
+      () => computeStatisticSeries(labels, video, seekbarHeaderGraph, seekbarHeaderReduction),
+    );
+  }, [labels, video, seekbarHeaderGraph, seekbarHeaderReduction, editSeq, useWorker]);
+
+  // Worker-computed series for heavy graphs over the frame threshold.
+  const [workerHeaderSeries, setWorkerHeaderSeries] = useState<Map<number, number> | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const requestIdRef = useRef(0);
+
+  // Off-thread computation for heavy graphs over the frame threshold. A
+  // monotonically-increasing request id guards against stale responses (e.g.
+  // a slow earlier job resolving after the graph/reduction changed). The
+  // worker is created lazily, reused across requests, and terminated on unmount.
+  useEffect(() => {
+    if (!useWorker || !labels || !video) {
+      // Not in worker mode: drop any prior worker result so the sync path wins.
+      setWorkerHeaderSeries(null);
+      return;
+    }
+
+    // Cache hit: re-selecting a heavy graph is instant, no worker round-trip
+    // (issue #105 AC2). Keyed by graph|reduction; invalidated on video/label change.
+    const cacheKey = `${seekbarHeaderGraph}|${seekbarHeaderReduction}`;
+    const cached = peekSeries(seriesCacheRef.current, video, editSeq, cacheKey);
+    if (cached) {
+      setWorkerHeaderSeries(cached);
+      return;
+    }
+
+    // Extract plain, structured-clone-safe frame arrays (no sleap-io objects).
+    const tracks = labels.tracks as unknown[];
+    const frames: WorkerRequest["frames"] = [];
+    for (const lf of labels.find({ video })) {
+      const instances = lf.instances.map((inst) => {
+        const track = (inst as { track?: unknown }).track ?? null;
+        const trackIdx = track === null ? -1 : tracks.indexOf(track);
+        const points = (inst as unknown as { numpy: () => number[][] }).numpy();
+        return { trackIdx, points };
+      });
+      frames.push({ frameIdx: lf.frameIdx, instances });
+    }
+
+    const worker =
+      workerRef.current ??
+      (workerRef.current = new Worker(
+        new URL("@/lib/statisticSeries.worker.ts", import.meta.url),
+        { type: "module" },
+      ));
+
+    const reqId = ++requestIdRef.current;
+    const handleMessage = (e: MessageEvent<WorkerResponse>) => {
+      // Ignore responses superseded by a newer request.
+      if (reqId !== requestIdRef.current) return;
+      const series = new Map(e.data.entries);
+      // Cache the result so re-selecting this heavy graph is instant.
+      putSeries(seriesCacheRef.current, video, editSeq, cacheKey, series);
+      setWorkerHeaderSeries(series);
+    };
+    worker.addEventListener("message", handleMessage);
+
+    // Clear the previous graph's result so a heavy->heavy switch doesn't keep
+    // drawing the stale polyline during the pending window (the request-id
+    // guard already prevents committing superseded data).
+    setWorkerHeaderSeries(null);
+
+    const req: WorkerRequest = {
+      graph: seekbarHeaderGraph as WorkerGraphType,
+      reduction: seekbarHeaderReduction,
+      trackCount: tracks.length,
+      primaryNodeIdx: 0,
+      frames,
+    };
+    worker.postMessage(req);
+
+    return () => {
+      // Invalidate this request and stop listening; the worker instance is
+      // kept for reuse and only torn down on unmount (see effect below).
+      worker.removeEventListener("message", handleMessage);
+    };
+  }, [useWorker, labels, video, seekbarHeaderGraph, seekbarHeaderReduction, editSeq]);
+
+  // Terminate the worker on unmount.
+  useEffect(() => {
+    return () => {
+      workerRef.current?.terminate();
+      workerRef.current = null;
+    };
+  }, []);
+
+  // The series actually rendered: worker result when offloaded, else sync.
+  const headerSeries = useWorker ? workerHeaderSeries : syncHeaderSeries;
+
+  // Switch graph type; reset reduction to the new graph's default if the
+  // current reduction is unsupported by it.
+  const selectGraph = useCallback(
+    (next: StatisticGraphType) => {
+      setKey("seekbarHeaderGraph", next);
+      const r = reconcileReduction(next, seekbarHeaderReduction);
+      if (r !== seekbarHeaderReduction) setKey("seekbarHeaderReduction", r);
+    },
+    [setKey, seekbarHeaderReduction]
+  );
+
+  // --- Seekbar header vertical resize (drag handle on the header's top edge) ---
+  // Dragging up grows the header, down shrinks it (clamped). The chosen height
+  // is written straight to the persisted store so the graph re-renders live and
+  // the preference survives reloads. Pure px->height math lives in
+  // seekbarHeaderHeight.ts (unit-tested).
+  const resizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
+
+  const handleResizePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      resizeRef.current = {
+        startY: e.clientY,
+        startHeight: useAppStore.getState().seekbarHeaderHeight,
+      };
+      // Pointer capture keeps move/up events flowing to the handle even when the
+      // cursor leaves it. Some WebViews throw on setPointerCapture — guard it.
+      try {
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      } catch {
+        // ignore — dragging still works via the element's own pointer events
+      }
+    },
+    []
+  );
+
+  const handleResizePointerMove = useCallback((e: React.PointerEvent) => {
+    const st = resizeRef.current;
+    if (!st) return;
+    const next = resizeHeaderHeight(st.startHeight, st.startY, e.clientY);
+    useAppStore.getState().set("seekbarHeaderHeight", next);
+  }, []);
+
+  const handleResizePointerUp = useCallback((e: React.PointerEvent) => {
+    if (!resizeRef.current) return;
+    resizeRef.current = null;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // --- Tracks band vertical resize (drag handle on the band's top edge) ---
+  // Mirrors the header resize. Writes an explicit height to the store (which
+  // overrides the auto-by-track-count sizing); the render effect below reads a
+  // DEFERRED copy of the height, so a fast drag doesn't repaint the (potentially
+  // huge: tracks × frames) lane set every pointer tick — it catches up on settle.
+  // Double-click resets to 0 = auto-fit.
+  const tracksResizeRef = useRef<{ startY: number; startHeight: number } | null>(
+    null
+  );
+
+  const handleTracksResizePointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      const st = useAppStore.getState();
+      // Seed from the CURRENTLY-RENDERED height so a drag from "auto" starts
+      // where the band actually is, not from 0.
+      const current =
+        st.seekbarTracksHeight > 0
+          ? st.seekbarTracksHeight
+          : (e.currentTarget.parentElement?.getBoundingClientRect().height ??
+            st.seekbarTracksHeight);
+      tracksResizeRef.current = { startY: e.clientY, startHeight: current };
+      try {
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+    },
+    []
+  );
+
+  const handleTracksResizePointerMove = useCallback((e: React.PointerEvent) => {
+    const st = tracksResizeRef.current;
+    if (!st) return;
+    const next = resizeTracksHeight(st.startHeight, st.startY, e.clientY);
+    useAppStore.getState().set("seekbarTracksHeight", next);
+  }, []);
+
+  const handleTracksResizePointerUp = useCallback((e: React.PointerEvent) => {
+    if (!tracksResizeRef.current) return;
+    tracksResizeRef.current = null;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const handleTracksResizeReset = useCallback(() => {
+    useAppStore.getState().set("seekbarTracksHeight", 0); // back to auto-fit
+  }, []);
+
+  const [isDragging, setIsDragging] = useState(false);
+  const [hoverFrame, setHoverFrame] = useState<number | null>(null);
+  // Cursor X within the seekbar container (px), used to position the floating
+  // hover-preview tooltip. Set alongside hoverFrame on mouse move; cleared on leave.
+  const [hoverX, setHoverX] = useState<number | null>(null);
+  // Tracks band hover: which lane the cursor is over, and the band's scroll
+  // offset (so the side-column name label lines up with the highlighted lane).
+  // Setting these NEVER redraws the lane canvas (it isn't in the canvas effect's
+  // deps) — only the small overlay + label re-render, so hover can't jank.
+  const [hoveredTrackIdx, setHoveredTrackIdx] = useState<number | null>(null);
+  const [tracksScrollTop, setTracksScrollTop] = useState(0);
+
+  const handleTracksHoverMove = useCallback(
+    (e: React.PointerEvent) => {
+      const container = tracksContainerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const yInContent = e.clientY - rect.top + container.scrollTop;
+      const laneH = tracksLaneHeightRef.current;
+      if (laneH <= 0) return;
+      const idx = Math.floor((yInContent - TRACKS_TOP_PAD_PX) / laneH);
+      // Guard: only re-render when the hovered LANE actually changes (crossing a
+      // lane boundary), not on every sub-pixel move.
+      setHoveredTrackIdx((prev) => (prev === idx ? prev : idx));
+    },
+    []
+  );
+  const handleTracksHoverLeave = useCallback(() => setHoveredTrackIdx(null), []);
+  const handleTracksScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
+    setTracksScrollTop(e.currentTarget.scrollTop);
+  }, []);
+  // While dragging, the solid playhead follows the cursor (this value) instead
+  // of frameIdx, so it glides smoothly even while the image load lags behind on
+  // a slow backend. null when not scrubbing → playhead tracks the loaded frame.
+  const [scrubFrame, setScrubFrame] = useState<number | null>(null);
+
+  // Convert pixel X to frame index
+  const pixelToFrame = useCallback(
+    (clientX: number): number => {
+      const canvas = canvasRef.current;
+      if (!canvas || totalFrames === 0) return 0;
+      const rect = canvas.getBoundingClientRect();
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      return Math.round(ratio * (totalFrames - 1));
+    },
+    [totalFrames]
+  );
+
+  /** Find the nearest labeled frame within snap threshold pixels. */
+  const snapToLabeledFrame = useCallback(
+    (clientX: number): number | null => {
+      const canvas = canvasRef.current;
+      if (!canvas || !labels || !video || totalFrames === 0) return null;
+
+      const rect = canvas.getBoundingClientRect();
+      const clickX = clientX - rect.left;
+
+      let closestFrame: number | null = null;
+      let closestDist = Infinity;
+
+      for (const lf of labels.labeledFrames) {
+        if (lf.video !== video) continue;
+        // Skip empty LabeledFrames (no instances) — snapping to one would land
+        // on a frame with no image (e.g. pkg.slp leftovers).
+        if (lf.instances.length === 0) continue;
+        const frameX = (lf.frameIdx / (totalFrames - 1)) * rect.width;
+        const dist = Math.abs(clickX - frameX);
+        if (dist < closestDist && dist <= SNAP_THRESHOLD_PX) {
+          closestDist = dist;
+          closestFrame = lf.frameIdx;
+        }
+      }
+
+      return closestFrame;
+    },
+    [labels, video, totalFrames]
+  );
+
+  // Resolve a scrub position. In "labeled frames only" mode (#137), snap to the
+  // nearest labeled frame so clicks/drag never land in a dead gap; otherwise the
+  // raw linear position. Falls back to raw when there are no labeled frames.
+  const resolveScrubFrame = useCallback(
+    (clientX: number): number => {
+      const raw = pixelToFrame(clientX);
+      if (!isConfined) return raw;
+      return nearestFrameInDomain(domainIndices, raw) ?? raw;
+    },
+    [pixelToFrame, isConfined, domainIndices]
+  );
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+
+      const frame = pixelToFrame(e.clientX);
+
+      if (e.shiftKey) {
+        // Start range selection anchored at the current frame
+        const currentFrame = useAppStore.getState().frameIdx;
+        setIsSelectingRange(true);
+        setRangeAnchor(currentFrame);
+        const start = Math.min(currentFrame, frame);
+        const end = Math.max(currentFrame, frame);
+        useAppStore.getState().set("frameRange", [start, end]);
+        return;
+      }
+
+      // In a confined mode (#137) snap to the nearest in-domain frame;
+      // otherwise the closest labeled frame within the threshold (existing).
+      const targetFrame = isConfined
+        ? resolveScrubFrame(e.clientX)
+        : (snapToLabeledFrame(e.clientX) ?? frame);
+
+      const curFrame = useAppStore.getState().frameIdx;
+      setFrameIdx(targetFrame);
+      setIsDragging(true);
+      // Claim the scrub serialization gate for this first read — but only if it
+      // actually changes the frame. Claiming when the frame is unchanged would
+      // jam the gate: VideoPlayer's read effect only re-runs on a frameIdx
+      // change, so nothing would clear it and the playhead would freeze until
+      // release. The drag loop won't issue the next frame until it's cleared.
+      if (targetFrame !== curFrame) {
+        useAppStore.getState().set("frameLoading", true);
+      }
+      // Clear range on normal click
+      useAppStore.getState().set("frameRange", null);
+    },
+    [pixelToFrame, snapToLabeledFrame, resolveScrubFrame, isConfined, setFrameIdx]
+  );
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      const frame = pixelToFrame(e.clientX);
+      setHoverFrame(frame);
+      // Record cursor X within the container so the hover tooltip can follow it.
+      const rect = e.currentTarget.getBoundingClientRect();
+      setHoverX(e.clientX - rect.left);
+
+      if (isSelectingRange && rangeAnchor !== null) {
+        const start = Math.min(rangeAnchor, frame);
+        const end = Math.max(rangeAnchor, frame);
+        useAppStore.getState().set("frameRange", [start, end]);
+        return;
+      }
+      // During a drag, frame updates are owned by the rAF-coalesced loop in the
+      // isDragging effect below — it applies only the latest cursor position once
+      // per animation frame. Calling setFrameIdx here too would re-introduce the
+      // per-mousemove read pile-up we're trying to avoid.
+    },
+    [isSelectingRange, rangeAnchor, pixelToFrame]
+  );
+
+  const handleMouseUp = useCallback(() => {
+    setIsDragging(false);
+    setIsSelectingRange(false);
+    setRangeAnchor(null);
+  }, []);
+
+  const handleMouseLeave = useCallback(() => {
+    setHoverFrame(null);
+    setHoverX(null);
+    setIsSelectingRange(false);
+    setRangeAnchor(null);
+  }, []);
+
+  // Hovering the header graph shows the same frame-info tooltip as the scrubbar
+  // (PyQt parity — the occupancy graph reports the frame under the cursor). The
+  // header canvas shares the seekbar's subgrid column, so pixelToFrame (keyed to
+  // the scrubbar canvas) maps correctly; hoverX is measured against containerRef
+  // so the shared tooltip's clamp/position math is unchanged. This move handler
+  // stays hover-only; click/drag-to-seek on the header is wired via the
+  // scrubbar's handleMouseDown/handleMouseUp (the drag loop is window-bound, so a
+  // drag started on the header scrubs just like one started on the bar).
+  const handleHeaderMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      setHoverFrame(pixelToFrame(e.clientX));
+      const container = containerRef.current;
+      if (container) setHoverX(e.clientX - container.getBoundingClientRect().left);
+    },
+    [pixelToFrame]
+  );
+
+  // Tooltip lines for the frame under the cursor, computed by the pure
+  // formatter (mirrors PyQt get_val_tooltip). overlayVersion is a dep so counts
+  // refresh after labeling edits (labels is mutated in place).
+  const hoverInfo = useMemo(() => {
+    if (hoverFrame === null || !labels || !video) return null;
+    const lf = labels.find({ video, frameIdx: hoverFrame })[0] ?? null;
+    const isSuggested = (labels.suggestions ?? []).some(
+      (sf) => sf.video === video && sf.frameIdx === hoverFrame,
+    );
+    return frameHoverInfo(lf, hoverFrame, { isSuggested });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hoverFrame, labels, video, overlayVersion]);
+
+  // Position the hover tooltip centered on the cursor, clamped to the seekbar so
+  // it never spills off either edge. Measuring the rendered width (nowrap) lets
+  // the clamp account for the box, unlike a CSS-only translate. Layout effect
+  // runs pre-paint, so there's no flash at the default position.
+  useLayoutEffect(() => {
+    const tip = tooltipRef.current;
+    const container = containerRef.current;
+    if (!tip || !container || hoverX === null) return;
+    const cw = container.clientWidth;
+    const w = tip.offsetWidth;
+    // The tooltip is positioned in the bar's wrapper; the canvas is inset in it.
+    const x = container.offsetLeft + hoverX;
+    tip.style.left = `${Math.max(0, Math.min(container.offsetLeft + cw - w, x - w / 2))}px`;
+  }, [hoverX, hoverInfo]);
+
+  // Global mouse tracking during seekbar drag — serialized read loop.
+  //
+  // A cold ImageVideo frame loads in ~55 ms on a network mount (~18 reads/s
+  // measured), but mousemove fires ~10x faster. Issuing setFrameIdx on every
+  // move (or even once per animation frame) requests reads faster than the
+  // mount can serve them, so they pile up and the painted frame trails the
+  // cursor — fast OR slow drag.
+  //
+  // Instead we mirror PyQt SLEAP's video worker: never more than one read in
+  // flight. Each animation frame we record only the latest cursor X, and issue
+  // it ONLY when no read is loading (frameLoading is cleared by VideoPlayer when
+  // the previous frame finishes). Intermediate positions we flew past are
+  // dropped. The frame then tracks the cursor with one read of latency (~55 ms)
+  // instead of an unbounded backlog, and a slow drag (moves slower than reads
+  // complete) drops nothing.
+  //
+  // Scoped to drag only — single clicks, arrow-steps, and playback are
+  // unchanged. Note: this can't beat the mount's ~18 frames/s on *cold* frames;
+  // warm/prefetched frames load in ~0 ms and scrub at full rate.
+  useEffect(() => {
+    if (!isDragging) return;
+
+    document.body.style.userSelect = "none";
+
+    // Mark scrubbing. VideoPlayer reads this to (a) skip the expensive per-frame
+    // histogram (OffscreenCanvas + getImageData ≈ 10 MB/frame, which can
+    // OOM-crash the renderer at fast scrub rates) and (b) pass
+    // getFrame({ prefetch: false }) so the backend skips its read-ahead window —
+    // wasted while scrubbing (we jump past those frames) and ~3.6x slower
+    // foreground reads under the 6-wide prefetch concurrency on a slow mount.
+    useAppStore.getState().set("isScrubbing", true);
+
+    // Abort-preempt "chase-newest" scrub (scrub-proxy v2, Thread B) applies only
+    // to the mp4 backend: a signal-aware getFrame + drop-stale queue let a newer
+    // cursor position abort the in-flight decode. ImageVideo/HDF5 ignore the
+    // signal, so they keep the one-read frameLoading gate that #187 relies on.
+    // Detected via decodeAhead presence — only the mp4 backend has it. The
+    // backend is stable for the life of a drag, so compute once.
+    const scrubBackend = useAppStore.getState().video?.backend as {
+      decodeAhead?: unknown;
+      nearestKeyframe?: (frameIndex: number) => number;
+    } | null;
+    const chaseNewest = typeof scrubBackend?.decodeAhead === "function";
+
+    let pendingX: number | null = null; // latest cursor position (coalesced)
+    let lastIssuedX: number | null = null; // position we last issued a read for
+    let lastIssuedFrame: number | null = null; // frame we last issued (chase-newest)
+    let lastScrubFrame: number | null = null; // last frame the bar glided to
+    let prevCursorFrame: number | null = null; // cursor frame last tick (velocity)
+    let rafId = 0;
+    const tick = () => {
+      if (pendingX !== null) {
+        const cursorFrame = resolveScrubFrame(pendingX);
+        // Smooth playhead: glide the bar to the cursor every frame, decoupled
+        // from the gated image load below — so the bar follows even when the
+        // backend can't decode that fast.
+        if (cursorFrame !== lastScrubFrame) {
+          lastScrubFrame = cursorFrame;
+          setScrubFrame(cursorFrame);
+        }
+        if (chaseNewest) {
+          // mp4 chase-newest: issue the latest frame as soon as it changes; no
+          // gate. A newer position supersedes and aborts the in-flight decode
+          // (VideoPlayer cleanup) and the backend drops stale queued reads, so
+          // only the newest actually decodes — the preview tracks the cursor into
+          // cold frames instead of finishing decodes it already dragged past.
+          //
+          // Keyframe preview: on a FAST fling (cursor outrunning exact decode),
+          // snap the issued frame to the nearest keyframe — a lone I-frame decode
+          // that's ~instant, so the preview keeps up instead of stalling until you
+          // pause. Slow/precise drags keep exact frames. The bar (scrubFrame)
+          // still glides to the true cursor; release settles on the exact frame.
+          const fast =
+            isFastScrub({
+              cursorFrame,
+              prevCursorFrame,
+              threshold: FAST_SCRUB_FRAMES_PER_TICK,
+            }) && typeof scrubBackend?.nearestKeyframe === "function";
+          const target = fast
+            ? (scrubBackend as { nearestKeyframe: (n: number) => number })
+                .nearestKeyframe(cursorFrame)
+            : cursorFrame;
+          if (
+            target !== lastIssuedFrame &&
+            target !== useAppStore.getState().frameIdx
+          ) {
+            lastIssuedFrame = target;
+            setFrameIdx(target);
+          }
+        } else {
+          // Gated image load (ImageVideo/HDF5): at most one read in flight,
+          // always the latest frame.
+          if (pendingX !== lastIssuedX && !useAppStore.getState().frameLoading) {
+            lastIssuedX = pendingX;
+            // Only claim the gate + issue when the frame actually changes —
+            // issuing the frame already showing wouldn't trigger a read to clear
+            // the gate, jamming the loop.
+            if (cursorFrame !== useAppStore.getState().frameIdx) {
+              useAppStore.getState().set("frameLoading", true); // claim the slot
+              setFrameIdx(cursorFrame);
+            }
+          }
+        }
+        // Velocity baseline for the next tick's fast/slow decision.
+        prevCursorFrame = cursorFrame;
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      pendingX = e.clientX; // only the latest position survives to the next tick
+    };
+
+    const handleGlobalMouseUp = () => {
+      setIsDragging(false);
+    };
+
+    window.addEventListener("mousemove", handleGlobalMouseMove);
+    window.addEventListener("mouseup", handleGlobalMouseUp);
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      // Scrub over — re-enable the per-frame histogram. Set before the flush
+      // below so the final frame computes its histogram.
+      useAppStore.getState().set("isScrubbing", false);
+      // Apply the final cursor position so release lands exactly where the user
+      // let go, even if it was mid-read when they released.
+      if (pendingX !== null && pendingX !== lastIssuedX) {
+        setFrameIdx(resolveScrubFrame(pendingX));
+      }
+      // Drag over: hand the playhead back to the loaded frame (frameIdx now
+      // holds the release position, so the bar stays put — no backward jump).
+      setScrubFrame(null);
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", handleGlobalMouseMove);
+      window.removeEventListener("mouseup", handleGlobalMouseUp);
+    };
+  }, [isDragging, resolveScrubFrame, setFrameIdx]);
+
+  // Render instance count header graph
+  useEffect(() => {
+    const canvas = headerCanvasRef.current;
+    const container = headerContainerRef.current;
+    if (!canvas || !container) return;
+
+    const rect = container.getBoundingClientRect();
+    canvas.width = rect.width * window.devicePixelRatio;
+    canvas.height = seekbarHeaderHeight * window.devicePixelRatio;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+    const w = rect.width;
+    // Draw against the current (user-resizable) header height so a taller
+    // header spreads values out — bars/polylines scale with `h`.
+    const h = seekbarHeaderHeight;
+
+    ctx.clearRect(0, 0, w, h);
+
+    if (totalFrames === 0 || !labels || !video) return;
+
+    if (seekbarHeaderGraph === "none") return;
+
+    // Reserve a top band for the frame-number labels + headroom so peaks don't
+    // touch the very top edge (scales with height, capped).
+    const topPad = Math.round(Math.min(18, h * 0.35));
+    const usable = Math.max(1, h - topPad);
+
+    // The graph's value range, for the Y-axis scale labels.
+    let scale: { min: number; max: number } | null = null;
+
+    if (seekbarHeaderGraph === "instance-count") {
+      // Build instance count per frame
+      const currentVideo = video;
+      let maxCount = 0;
+      const counts = new Map<number, number>();
+      for (const lf of labels.labeledFrames) {
+        if (lf.video !== currentVideo) continue;
+        counts.set(lf.frameIdx, lf.instances.length);
+        if (lf.instances.length > maxCount) maxCount = lf.instances.length;
+      }
+
+      // Draw bar chart (skip if no instances; markers still draw below).
+      if (maxCount > 0) {
+        ctx.fillStyle = HEADER_FILL;
+        for (const [fi, count] of counts) {
+          const x = (fi / (totalFrames - 1)) * w;
+          const barH = (count / maxCount) * usable; // leave `topPad` headroom
+          ctx.fillRect(x, h - barH, Math.max(1, w / totalFrames), barH);
+        }
+        scale = { min: 0, max: maxCount };
+      }
+    } else if (headerSeries) {
+      scale = drawHeaderSeries(ctx, headerSeries, totalFrames, w, h, topPad);
+    }
+
+    // Frame-index markers (gridlines + labels) + a left-edge Y-axis scale, both
+    // on top of the graph — PyQt parity + readability.
+    drawHeaderFrameMarkers(ctx, totalFrames, w, h);
+    if (scale) drawHeaderYScale(ctx, scale.min, scale.max, h, topPad);
+  }, [totalFrames, labels, video, seekbarHeaderGraph, headerSeries, seekbarHeaderHeight, resizeTick]);
+
+  // Precompute the seekbar header's static content (per-track occupied frames +
+  // labeled-frame marks) ONCE per data change — NOT per frame. The draw effect
+  // below re-runs on every frameIdx change (to move the 1px playhead); doing the
+  // O(tracks × labeledFrames × instances) `.some()` scan there (with a
+  // getState() per inner iteration) froze the UI for seconds on videos with many
+  // labeled frames. A single pass + a track→index Map makes it O(frames ×
+  // instances). Keyed on editSeq (see above), NOT overlayVersion, so this
+  // O(all frames) scan recomputes once per edit-commit — not on every drag tick.
+  const headerData = useMemo(() => {
+    if (!labels || !video) return null;
+    const tracks = labels.tracks as unknown[];
+    const trackIdxOf = new Map<unknown, number>(tracks.map((t, i) => [t, i]));
+    const byTrack: number[][] = tracks.map(() => []);
+    const marks: Array<[number, boolean, boolean]> = [];
+    for (const lf of labels.find({ video })) {
+      // A frame is "user-labeled" if it has any manual annotation — incl. a
+      // user-placed centroid with no skeleton instance (io.js isUserLabeled).
+      const userLabeled = isUserLabeledFrame(lf);
+      // Skip only truly empty frames; a centroid-only frame still gets a mark.
+      // A frame holding only predicted boxes still gets a (predicted) mark.
+      if (lf.instances.length === 0 && !userLabeled && (lf.bboxes?.length ?? 0) === 0) continue;
+      for (const inst of lf.instances) {
+        const track = (inst as { track?: unknown }).track ?? null;
+        const ti = track === null ? -1 : trackIdxOf.get(track) ?? -1;
+        if (ti >= 0) byTrack[ti].push(lf.frameIdx);
+      }
+      const isNeg = (lf as { isNegative?: boolean }).isNegative ?? false;
+      marks.push([lf.frameIdx, userLabeled, isNeg]);
+    }
+    return { byTrack, marks };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [labels, video, editSeq]);
+
+  // Per-track occupancy band sizing. It AUTO-heights to the track count (legible
+  // lanes for many-track projects) unless the user has dragged it to an explicit
+  // height. `deferredTracksHeight` lags the crisp canvas redraw behind a fast
+  // resize drag: the DOM element resizes live (cheap CSS), while the potentially
+  // huge lane bitmap (tracks × frames) is only re-rasterized once the drag settles
+  // — so resizing never janks the GUI (the #366 useDeferredValue pattern).
+  const trackLaneCount = headerData?.byTrack.length ?? 0;
+  const hasTrackOccupancy =
+    !!headerData && headerData.byTrack.some((f) => f.length > 0);
+  const tracksBandHeight = effectiveTracksHeight(
+    seekbarTracksHeight,
+    trackLaneCount
+  );
+  // Lanes GROW to fill the band as it's dragged taller, bottoming out at a
+  // minimum height beyond which the (full-height) canvas overflows the viewport
+  // and scrolls. The canvas height only changes with the band height in the
+  // few-track "fill" regime (a cheap redraw); the many-track "scroll" regime
+  // pins the canvas at count×minLane, independent of the band height, so
+  // resizing there is pure CSS with no redraw. `useDeferredValue` makes even the
+  // fill-regime redraw lag behind a fast drag (the #366 pattern) — the viewport
+  // resizes live, the crisp lane bitmap catches up on settle.
+  const deferredBandHeight = useDeferredValue(tracksBandHeight);
+  const tracksMetrics = tracksLaneMetrics(deferredBandHeight, trackLaneCount);
+  const tracksLaneHeight = tracksMetrics.laneHeight;
+  const tracksCanvasHeight = tracksMetrics.canvasHeight;
+  // Latest lane height for the hover hit-test (read from the pointer handler,
+  // which is a stable useCallback and would otherwise close over a stale value).
+  tracksLaneHeightRef.current = tracksLaneHeight;
+  // Richer interactions (hover highlight + name) only when the band is expanded
+  // past its minimum — at the compact strip size it's just the lane bitmap.
+  const tracksExpanded = tracksBandHeight > TRACKS_MIN_HEIGHT;
+  const hoveredTrackValid =
+    hoveredTrackIdx != null &&
+    hoveredTrackIdx >= 0 &&
+    hoveredTrackIdx < trackLaneCount;
+  const hoveredTrackName =
+    hoveredTrackValid && labels
+      ? ((labels.tracks[hoveredTrackIdx as number] as { name?: string })?.name ??
+        `track ${hoveredTrackIdx}`)
+      : null;
+  const showTrackHover = tracksExpanded && hoveredTrackValid;
+
+  // Render seekbar
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    if (!canvas || !container) return;
+
+    const rect = container.getBoundingClientRect();
+    canvas.width = rect.width * window.devicePixelRatio;
+    canvas.height = rect.height * window.devicePixelRatio;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+    const w = rect.width;
+    const h = rect.height;
+
+    // Slightly lighter than the card, so the bar reads as a track.
+    ctx.fillStyle = "#27272a";
+    ctx.fillRect(0, 0, w, h);
+
+    if (totalFrames === 0) return;
+
+    const frameToX = (f: number) => (f / (totalFrames - 1)) * w;
+
+    // The ruler strip (frame numbers) on top, then gridlines through both,
+    // matching the header's, so the bar isn't a flat strip.
+    drawBarRuler(ctx, totalFrames, w);
+    drawFrameGridlines(ctx, totalFrames, w, h);
+
+    // Draw frame range selection
+    if (frameRange) {
+      const x1 = frameToX(frameRange[0]);
+      const x2 = frameToX(frameRange[1]);
+      ctx.fillStyle = "rgba(59, 130, 246, 0.25)";
+      ctx.fillRect(x1, RULER_PX, x2 - x1, h - RULER_PX);
+    }
+
+    // Track occupancy is drawn on its OWN dedicated strip below the bar (full
+    // alpha, taller lanes — see the tracks-strip render effect) instead of being
+    // crammed into ≤4px 60%-alpha lanes here, fighting the marks/playhead/hover.
+
+    // Draw suggestion frame marks: small bright-yellow flags on the bar's top
+    // edge, just under the ruler.
+    if (labels) {
+      const currentVideo = useAppStore.getState().video;
+      ctx.fillStyle = "#fde047"; // bright yellow
+      ctx.beginPath();
+      for (const sf of labels.suggestions ?? []) {
+        if (sf.video !== currentVideo) continue;
+        const x = frameToX(sf.frameIdx);
+        ctx.moveTo(x - SUGGESTION_FLAG_HALF_WIDTH_PX, RULER_PX);
+        ctx.lineTo(x + SUGGESTION_FLAG_HALF_WIDTH_PX, RULER_PX);
+        ctx.lineTo(x, RULER_PX + SUGGESTION_FLAG_HEIGHT_PX);
+        ctx.closePath();
+      }
+      ctx.fill();
+    }
+
+    // Draw labeled frame marks (frame + user/predicted flag precomputed).
+    if (headerData) {
+      for (const [f, hasUser, isNeg] of headerData.marks) {
+        // red negative/background / blue user-labeled / light-blue predicted
+        ctx.fillStyle = isNeg ? "#ef4444" : hasUser ? "#3b82f6" : "#67e8f9";
+        ctx.fillRect(frameToX(f) - 1, h - 14, 2, 10);
+      }
+    }
+
+    // Draw the marked-frame bookmark: an amber down-triangle "flag" at the top
+    // of the bar, larger than the yellow suggestion flags.
+    if (markedFrame && markedFrame.video === video) {
+      const mx = frameToX(markedFrame.frameIdx);
+      ctx.fillStyle = "#f59e0b"; // amber
+      ctx.beginPath();
+      ctx.moveTo(mx - 4, RULER_PX);
+      ctx.lineTo(mx + 4, RULER_PX);
+      ctx.lineTo(mx, RULER_PX + 7);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Draw current frame indicator. While scrubbing, follow the cursor
+    // (scrubFrame) so the bar glides smoothly even if the image load lags;
+    // otherwise track the actually-loaded frame.
+    const curX = frameToX(scrubFrame ?? frameIdx);
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(curX - 1, 0, 2, h);
+
+    // Draw hover indicator — suppressed during a drag, where the solid bar
+    // already sits at the cursor (otherwise the two lines overlap).
+    if (hoverFrame !== null && scrubFrame === null) {
+      const hx = frameToX(hoverFrame);
+      ctx.fillStyle = "rgba(255,255,255,0.3)";
+      ctx.fillRect(hx - 0.5, 0, 1, h);
+    }
+  }, [frameIdx, scrubFrame, totalFrames, headerData, labels, palette, hoverFrame, video, frameRange, markedFrame]);
+
+  // Render the dedicated per-track occupancy band. Each track gets its own lane
+  // in its palette color at FULL alpha, so coverage is legible — versus the old
+  // ≤4px, 60%-alpha lanes crammed onto the bar. Recomputes only on
+  // data/palette/height/resize — NEVER per frame — and the height dep is the
+  // DEFERRED value, so a fast resize drag doesn't re-rasterize the (tracks ×
+  // frames) lane set every tick.
+  useEffect(() => {
+    const canvas = tracksCanvasRef.current;
+    const container = tracksContainerRef.current;
+    if (!canvas || !container || !headerData) return;
+    // clientWidth excludes a vertical scrollbar's width, so lanes fill the
+    // scrollable content area exactly.
+    const w = container.clientWidth;
+    const h = tracksCanvasHeight; // FULL height of all lanes (scrolls in the viewport)
+    if (w === 0 || h === 0) return;
+    const dpr = window.devicePixelRatio;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.scale(dpr, dpr);
+    ctx.fillStyle = "#141418";
+    ctx.fillRect(0, 0, w, h);
+    if (totalFrames === 0) return;
+
+    const frameToX = (f: number) => (f / (totalFrames - 1)) * w;
+    const rectW = Math.max(1, w / totalFrames);
+    // Lane fills its slot minus a gap; the gap shrinks for thin lanes so the
+    // occupancy stays visible (never a 0-height bar).
+    const gap = Math.min(TRACKS_LANE_GAP_PX, tracksLaneHeight * 0.25);
+    const barH = Math.max(1, tracksLaneHeight - gap);
+    const trackList = labels?.tracks;
+    headerData.byTrack.forEach((frameIdxs, trackIdx) => {
+      const trackName = (trackList?.[trackIdx] as { name?: string } | undefined)?.name ?? null;
+      ctx.fillStyle = rgbToCSS(getTrackColor(palette, trackIdx, trackName, trackColorOverrides), 1);
+      const y = TRACKS_TOP_PAD_PX + trackIdx * tracksLaneHeight;
+      for (const f of frameIdxs) ctx.fillRect(frameToX(f), y, rectW, barH);
+    });
+  }, [headerData, totalFrames, palette, trackColorOverrides, labels, tracksLaneHeight, tracksCanvasHeight, resizeTick]);
+
+  // Playback animation loop
+  useEffect(() => {
+    if (!isPlaying) return;
+
+    const interval = 1000 / (fps * playbackSpeed);
+    lastTimeRef.current = performance.now();
+
+    const tick = (now: number) => {
+      const elapsed = now - lastTimeRef.current;
+      if (elapsed >= interval) {
+        lastTimeRef.current = now - (elapsed % interval);
+        // keepPlaying: this is the playback advance itself, not a user seek, so
+        // it must not trip rule #3 (seek-pauses-playback) and stop the loop.
+        useAppStore.getState().incrementFrameIdx(1, { keepPlaying: true });
+      }
+      animFrameRef.current = requestAnimationFrame(tick);
+    };
+
+    animFrameRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(animFrameRef.current);
+  }, [isPlaying, playbackSpeed, fps]);
+
+  // Handle window resize
+  useEffect(() => {
+    const handleResize = () => {
+      // Re-run the main bar (via frameIdx) AND the header effect (via resizeTick)
+      // so both recompute their DPR backing store — the header ignores frameIdx.
+      setResizeTick((t) => t + 1);
+      useAppStore.getState().setFrameIdx(useAppStore.getState().frameIdx);
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  return (
+    <div
+      className={`grid shrink-0 ${
+        sidebarOnLeft ? "grid-cols-[auto_1fr]" : "grid-cols-[1fr_auto]"
+      }`}
+    >
+      {/* Instance count header graph - subgrid aligns canvas with seekbar below.
+          Height is user-resizable via the drag handle on its top edge. */}
+      <div
+        className="relative grid grid-cols-subgrid col-span-full items-center bg-card border-t border-border px-2 gap-2"
+        style={{ height: seekbarHeaderHeight }}
+      >
+        {/* Drag handle on the top edge — drag up to grow the header, down to
+            shrink. Sits on the border seam; shows a visible bar (like the
+            sidebar resize handle) that highlights on hover/drag. */}
+        <div
+          className="group absolute inset-x-0 top-0 z-10 flex h-3 -translate-y-1/2 cursor-ns-resize items-center justify-center"
+          onPointerDown={handleResizePointerDown}
+          onPointerMove={handleResizePointerMove}
+          onPointerUp={handleResizePointerUp}
+          onPointerCancel={handleResizePointerUp}
+          title="Drag to resize the seekbar header"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize seekbar header"
+        >
+          <div className="h-1.5 w-full bg-border transition-colors group-hover:bg-primary/50 group-active:bg-primary" />
+        </div>
+        <div
+          ref={headerContainerRef}
+          // mx-1: same inset as the main bar's canvas, so gridlines line up.
+          className="mx-1 overflow-hidden min-w-0 h-full cursor-pointer"
+          style={{ height: seekbarHeaderHeight }}
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleHeaderMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseLeave}
+        >
+          <canvas
+            ref={headerCanvasRef}
+            className="w-full h-full"
+            style={{ display: "block" }}
+          />
+        </div>
+        <div
+          className={`flex gap-1 shrink-0 items-center self-start ${controlsOrder} ${
+            sidebarOnLeft ? "justify-self-start" : "justify-self-end"
+          }`}
+        >
+          {/* Graph-type picker */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button
+                variant="subtle"
+                size="xs"
+                className="h-4 text-[10px] text-muted-foreground px-1 max-w-40 truncate"
+                title="Seekbar header graph"
+              >
+                {getGraphSpec(seekbarHeaderGraph)?.label ?? "None"}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="w-auto p-1" align="end" side="top">
+              <div className="flex flex-col">
+                {GRAPH_SPECS.map((spec) => (
+                  <Button
+                    key={spec.type}
+                    variant={spec.type === seekbarHeaderGraph ? "secondary" : "ghost"}
+                    size="xs"
+                    className="justify-start text-xs"
+                    onClick={() => selectGraph(spec.type)}
+                  >
+                    {spec.label}
+                  </Button>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+          {/* Reduction picker (only when the chosen graph supports reductions) */}
+          {(() => {
+            const reductions = getGraphSpec(seekbarHeaderGraph)?.reductions ?? [];
+            if (reductions.length === 0) return null;
+            return (
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="subtle"
+                    size="xs"
+                    className="h-4 text-[10px] text-muted-foreground px-1"
+                    title="Reduction"
+                  >
+                    {seekbarHeaderReduction}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-1" align="end" side="top">
+                  <div className="flex flex-col">
+                    {reductions.map((r) => (
+                      <Button
+                        key={r}
+                        variant={r === seekbarHeaderReduction ? "secondary" : "ghost"}
+                        size="xs"
+                        className="justify-center text-xs"
+                        onClick={() => setKey("seekbarHeaderReduction", r)}
+                      >
+                        {r}
+                      </Button>
+                    ))}
+                  </div>
+                </PopoverContent>
+              </Popover>
+            );
+          })()}
+        </div>
+      </div>
+
+      {/* Per-track occupancy band — its OWN resizable row (like the header),
+          so it can grow tall for many-track projects without overflowing the
+          fixed-height seekbar row. Auto-heights to the track count; drag the top
+          edge to resize, double-click the handle to auto-fit. Only when tracks
+          have occupancy; display-only (seek/hover stay on the bar). */}
+      {hasTrackOccupancy && (
+        <div
+          // grid-rows-[minmax(0,1fr)]: the row takes the band's height, not the
+          // full-height lane canvas's, so many tracks scroll inside the band
+          // instead of overflowing over the seekbar below.
+          className="relative grid grid-cols-subgrid grid-rows-[minmax(0,1fr)] col-span-full items-stretch bg-card border-t border-border px-2 gap-2"
+          style={{ height: tracksBandHeight }}
+        >
+          <div
+            className="group absolute inset-x-0 top-0 z-10 flex h-3 -translate-y-1/2 cursor-ns-resize items-center justify-center"
+            onPointerDown={handleTracksResizePointerDown}
+            onPointerMove={handleTracksResizePointerMove}
+            onPointerUp={handleTracksResizePointerUp}
+            onPointerCancel={handleTracksResizePointerUp}
+            onDoubleClick={handleTracksResizeReset}
+            title="Drag to resize the tracks band · double-click to auto-fit"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize tracks band"
+          >
+            <div className="h-1.5 w-full bg-border transition-colors group-hover:bg-primary/50 group-active:bg-primary" />
+          </div>
+          <div
+            ref={tracksContainerRef}
+            // mx-1: same inset as the main bar's canvas, so lanes line up.
+            className="relative mx-1 overflow-y-auto overflow-x-hidden min-w-0 h-full rounded-sm"
+            onPointerMove={tracksExpanded ? handleTracksHoverMove : undefined}
+            onPointerLeave={handleTracksHoverLeave}
+            onScroll={handleTracksScroll}
+          >
+            {/* Canvas is the FULL height of every lane; the container above is a
+                shorter viewport, so it scrolls when the lanes overflow. */}
+            <canvas
+              ref={tracksCanvasRef}
+              className="block w-full"
+              style={{ height: tracksCanvasHeight }}
+              aria-hidden="true"
+            />
+            {/* Hover highlight — a single overlay box over the hovered lane (in
+                content coords, so it scrolls with the canvas). NOT a canvas
+                redraw, so hovering can't jank. Slightly taller than the lane to
+                read as a "grow". */}
+            {showTrackHover && (
+              <div
+                className="pointer-events-none absolute inset-x-0 rounded-[1px] bg-white/15 ring-1 ring-white/70"
+                style={{
+                  top:
+                    TRACKS_TOP_PAD_PX +
+                    (hoveredTrackIdx as number) * tracksLaneHeight -
+                    1,
+                  height: tracksLaneHeight + 2,
+                }}
+              />
+            )}
+          </div>
+          {/* Controls-column cell — also the home for the hovered track's name.
+              `controlsOrder` (order-first when the sidebar is on the left) flows
+              it into the narrow `auto` column so the canvas stays in the wide
+              `1fr` column, aligned with the header/seekbar. */}
+          <div className={`relative min-w-0 ${controlsOrder}`}>
+            {showTrackHover && hoveredTrackName && (
+              <div
+                className="pointer-events-none absolute right-0 z-10 max-w-full -translate-y-1/2 truncate rounded bg-popover/95 px-1.5 py-0.5 text-[10px] leading-none text-popover-foreground ring-1 ring-primary/60 shadow-sm"
+                style={{
+                  top:
+                    TRACKS_TOP_PAD_PX +
+                    (hoveredTrackIdx as number) * tracksLaneHeight -
+                    tracksScrollTop +
+                    tracksLaneHeight / 2,
+                }}
+                title={hoveredTrackName}
+              >
+                {hoveredTrackName}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* `relative` keeps this row painted above the bands above it. */}
+      <div className="relative grid grid-cols-subgrid col-span-full items-center h-[64px] bg-card border-t border-border px-2 gap-2">
+        {/* Seekbar canvas (relative wrapper hosts the floating hover tooltip) */}
+        {/* The wrapper is painted like the canvas (ruler strip on top, the bar's
+            zinc-800 below), so the mx-1 inset reads as part of both rather than
+            a bar-coloured notch beside the ruler; the inset keeps marks at frame
+            0 and N off the bar's edge. */}
+        <div
+          className="relative min-w-0"
+          style={{
+            background: `linear-gradient(to bottom, ${RULER_FILL} ${RULER_PX}px, #27272a ${RULER_PX}px)`,
+          }}
+        >
+          <div
+            ref={containerRef}
+            // 36px bar + the 16px ruler strip on top (RULER_PX).
+            className="mx-1 h-[52px] cursor-pointer overflow-hidden min-w-0"
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseLeave}
+          >
+            <canvas
+              ref={canvasRef}
+              className="w-full h-full"
+              style={{ display: "block" }}
+            />
+          </div>
+          {/* Hover-preview tooltip — floats above the bar near the cursor
+              (positioned by the layout effect above), suppressed while
+              scrubbing/selecting (the solid playhead is there). */}
+          {hoverInfo && hoverX !== null && scrubFrame === null && !isSelectingRange && (
+            <div
+              ref={tooltipRef}
+              className="pointer-events-none absolute bottom-full left-0 z-50 mb-1 whitespace-nowrap rounded-md border border-border bg-popover/95 px-2 py-1 text-[10px] leading-tight text-popover-foreground shadow-md backdrop-blur-sm"
+            >
+              {hoverInfo.lines.map((line, i) => (
+                <div key={i} className={i === 0 ? "font-medium tabular-nums" : "text-muted-foreground"}>
+                  {line}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Transport controls */}
+        <TooltipProvider delayDuration={300}>
+          <div className={`flex gap-0.5 shrink-0 items-center ${controlsOrder}`}>
+          {/* Navigation domain: All -> Labeled -> Suggested -> Imaged (#137) */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant={navigationDomain !== "all" ? "default" : "subtle"}
+                size="icon-xs"
+                aria-label={navModeTooltip}
+                onClick={() => cycleNavigationDomain()}
+              >
+                {navigationDomain === "all" ? (
+                  <List />
+                ) : navigationDomain === "labeled" ? (
+                  <ListFilter />
+                ) : navigationDomain === "suggested" ? (
+                  <Lightbulb />
+                ) : (
+                  <Images />
+                )}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="top"><p>{navModeTooltip}</p></TooltipContent>
+          </Tooltip>
+          <div className="w-px h-4 bg-border mx-0.5" />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="subtle"
+                size="icon-xs"
+                onClick={() => useAppStore.getState().setFrameIdx(0)}
+              >
+                <SkipBack />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="top"><p>Go to start (Home)</p></TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="subtle"
+                size="icon-xs"
+                onClick={() => useAppStore.getState().incrementFrameIdx(-1)}
+              >
+                <ChevronLeft />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="top"><p>Previous frame (Left)</p></TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant={isPlaying ? "default" : "subtle"}
+                size="icon-xs"
+                onClick={() => togglePlay()}
+              >
+                {isPlaying ? <Pause /> : <Play />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="top"><p>{isPlaying ? "Pause" : "Play"}</p></TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="subtle"
+                size="icon-xs"
+                onClick={() => useAppStore.getState().incrementFrameIdx(1)}
+              >
+                <ChevronRight />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="top"><p>Next frame (Right)</p></TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="subtle"
+                size="icon-xs"
+                onClick={() => {
+                  const { video } = useAppStore.getState();
+                  const total = video?.shape?.[0] ?? 0;
+                  if (total > 0) useAppStore.getState().setFrameIdx(total - 1);
+                }}
+              >
+                <SkipForward />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="top"><p>Go to end (End)</p></TooltipContent>
+          </Tooltip>
+          {/* Speed selector */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button
+                variant="subtle"
+                size="xs"
+                className="text-[10px] text-muted-foreground tabular-nums w-8 px-0"
+                title="Playback speed"
+              >
+                {playbackSpeed}x
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="w-auto p-1" align="end" side="top">
+              <div className="flex flex-col">
+                {PLAYBACK_SPEEDS.map((speed) => (
+                  <Button
+                    key={speed}
+                    variant={speed === playbackSpeed ? "secondary" : "ghost"}
+                    size="xs"
+                    className="justify-center tabular-nums text-xs"
+                    onClick={() => setPlaybackSpeed(speed)}
+                  >
+                    {speed}x
+                  </Button>
+                ))}
+              </div>
+            </PopoverContent>
+          </Popover>
+        </div>
+        </TooltipProvider>
+      </div>
+    </div>
+  );
+}

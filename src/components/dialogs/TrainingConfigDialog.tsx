@@ -1,0 +1,2219 @@
+import { useRef, useCallback, useState, useEffect, useMemo } from "react";
+import { createPortal } from "react-dom";
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { NumberInput } from "@/components/NumberInput";
+import { toast } from "@/lib/notify";
+import { keepOpenOnToastClick } from "@/lib/dialogToasts";
+import { LogNumberInput } from "@/components/LogNumberInput";
+import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Search, HelpCircle, RefreshCw, Check, RotateCcw, Lightbulb, AlertTriangle } from "lucide-react";
+import type { Labels } from "@talmolab/sleap-io.js";
+import type { ConfigFile, ConfigHyperparams, Backbone, BackboneSize, ModelType, DataPipeline, ColorMode } from "@/stores/trainingStore";
+import { getSlotLabel, getConfigSlots, useTrainingStore, BACKBONE_SIZES, resolveBackboneSize } from "@/stores/trainingStore";
+import { checkWandbAuth, detectGpu, type WandbAuth } from "@/platform/backend";
+import { BackendPicker } from "@/components/common/BackendPicker";
+import { useAppStore } from "@/stores/appStore";
+import { ModelStatsPreview } from "@/components/dialogs/ModelStatsPreview";
+import type { PreviewFrame } from "@/lib/workerLabels";
+import { getBaselineProfilesForHead, getRecommendedProfileForHead, slotToHeadType } from "@/lib/trainingProfiles";
+import { computeInstanceSizeStats, recommendMaxStride, recommendBackboneProfile, recommendCentroidScale, resolveEffectiveCropSize, detectVideoChannels, resolveInputChannels } from "@/lib/modelStats";
+import { computeNodeVisibility, visibilityTier, type NodeVisibility } from "@/lib/anchorVisibility";
+import { isTauri } from "@/lib/platform";
+import {
+  copyTrainingConfigsToClipboard,
+  exportTrainingJobPackage,
+  saveTrainingConfigFiles,
+  type TrainingConfigRequest,
+} from "@/commands/trainingConfigExport";
+import { POST_TRAINING_TARGET_OPTIONS, describeClip } from "@/lib/postTrainingTarget";
+import { cropSizeWarnings, isCropHead, negativeFramesWarning, usesNegativeFrames } from "@/lib/cropWarnings";
+import { confirmDialog } from "@/stores/confirmStore";
+import { headTypeMatches } from "@/lib/bboxModels";
+import { BboxTrainingFields } from "@/components/panels/BboxTrainingFields";
+
+/** Tailwind text color per visibility tier, matching the Training panel's log coloring. */
+const VISIBILITY_COLOR: Record<ReturnType<typeof visibilityTier>, string> = {
+  high: "text-green-600 dark:text-green-400",
+  medium: "text-yellow-600 dark:text-yellow-400",
+  low: "text-destructive",
+};
+
+// ── Props ──────────────────────────────────────────────────────────
+
+/**
+ * The subset of `useTrainingStore`'s config-mutating actions this dialog
+ * normally writes to directly — overridable so the launcher wizard (PR5b)
+ * can edit a wizard-local config copy instead of the app's real training
+ * config when building a worker-file job. `parseYamlConfig` is never part
+ * of this: it only parses and returns a `ConfigFile`, writing nothing, so
+ * both modes always call the real `useTrainingStore` one.
+ */
+export interface TrainingConfigActions {
+  addConfigFile: (file: ConfigFile) => void;
+  updateConfigCheckpointPath: (slot: string, path: string | null) => void;
+  resetConfigHyperparams: (slot: string) => void;
+}
+
+interface TrainingConfigDialogProps {
+  open: boolean;
+  onClose: () => void;
+  modelType: ModelType;
+  configs: ConfigFile[];
+  onUpdateSlot: (slot: string, updates: Partial<ConfigHyperparams>) => void;
+  inferenceTarget: string;
+  onInferenceTargetChange: (target: string) => void;
+  remoteEnabled: boolean;
+  onRemoteEnabledChange: (enabled: boolean) => void;
+  skeletonNodes?: string[];
+  sampleCount: number;
+  onSampleCountChange: (v: number) => void;
+  skipUserLabeled: boolean;
+  onSkipUserLabeledChange: (v: boolean) => void;
+  existingPredictions: "clear_all" | "replace" | "keep";
+  onExistingPredictionsChange: (v: "clear_all" | "replace" | "keep") => void;
+  /** Client-side only — no sleap-nn schema field for this, see trainingStore.ts. */
+  autoOpenWandb: boolean;
+  onAutoOpenWandbChange: (v: boolean) => void;
+  /** Client-side only — post-training model export ("none" = don't export). */
+  exportFormat: "none" | "onnx" | "tensorrt";
+  onExportFormatChange: (v: "none" | "onnx" | "tensorrt") => void;
+  /** Run post-training inference on the exported model (falls back to the checkpoint on failure). */
+  useExportedForInference: boolean;
+  onUseExportedForInferenceChange: (v: boolean) => void;
+  /**
+   * Launcher wizard (PR5b worker-file jobs): replaces every open-project
+   * labels/skeleton read (`skeleton = labelsOverride.skeletons[0]`) with a
+   * worker-side `Labels` loaded via `loadWorkerLabels` instead. Absent ->
+   * identical behavior to before (reads the open project).
+   */
+  labelsOverride?: Labels;
+  /** Launcher wizard: fetches the receptive-field preview's frame from the worker when `labelsOverride`'s video can't be decoded here (see `ModelStatsPreview`'s `remoteFrame`). */
+  remoteFrame?: (videoIndex: number, frameIdx: number) => Promise<PreviewFrame>;
+  /** See {@link TrainingConfigActions}. Absent -> identical behavior to before (writes `useTrainingStore` directly). */
+  configActions?: TrainingConfigActions;
+  /**
+   * `"worker-file"` hides the Remote Training section (picking a backend is
+   * meaningless — the worker this job targets is already chosen outside
+   * this dialog) and the local checkpoint/config "Browse..." affordances
+   * (they open a LOCAL file dialog, which can't reach a path on the
+   * worker). Default `"project"`.
+   */
+  mode?: "project" | "worker-file";
+}
+
+// ── Constants ──────────────────────────────────────────────────────
+
+const MODEL_TYPE_LABELS: Record<ModelType, string> = {
+  single_animal: "Single Animal",
+  top_down: "Top-Down",
+  bottom_up: "Bottom-Up",
+  top_down_id: "Top-Down + ID",
+  bottom_up_id: "Bottom-Up + ID",
+  bbox: "Box Detector",
+  top_down_bbox: "Top-Down (Box Crops)",
+};
+
+const MODEL_TYPE_DESCRIPTIONS: Record<ModelType, string> = {
+  single_animal: 'This pipeline uses a single "confidence map" model to predict node locations for a single animal in the frame.',
+  top_down: 'This pipeline uses two models: a "centroid" model to locate and crop around each animal in the frame, and a "centered-instance confidence map" model for predicted node locations for each individual animal predicted by the centroid model.',
+  bottom_up: 'This pipeline uses a single "bottom-up" model that predicts confidence maps for all body parts and part affinity fields to group them into individual animals.',
+  top_down_id: 'This pipeline uses two models: a "centroid" model to locate and crop around each animal in the frame, and a "top-down identity" model that predicts node locations and classifies identity for each individual animal.',
+  bottom_up_id: 'This pipeline uses a single "bottom-up identity" model that predicts confidence maps, part affinity fields for grouping, and identity classification maps.',
+  bbox: 'This pipeline uses a single "box detector" model that predicts a bounding box around each animal in the frame, with a score; it predicts no poses. Its training boxes are the boxes drawn in the project, or boxes around the labeled poses. Pick CenterNet or SSD with the config preset. Needs sleap-nn 0.3.5 or newer.',
+  top_down_bbox: 'This pipeline uses two models: a "box detector" model to find a box around each animal in the frame, and a "centered-instance confidence map" model that predicts node locations inside each box, cropped and resized so animals of different sizes fill the crop the same way. Needs sleap-nn 0.3.5 or newer.',
+};
+
+const PIPELINE_NAV = [
+  { id: "pipeline-type", label: "Pipeline Type" },
+  { id: "pipeline-inference", label: "Inference Target" },
+  { id: "pipeline-preprocessing", label: "Pre/Post-proc." },
+  { id: "pipeline-performance", label: "Performance" },
+  { id: "pipeline-wandb", label: "W&B" },
+  { id: "pipeline-evaluation", label: "Evaluation" },
+  { id: "pipeline-output", label: "Output" },
+  { id: "pipeline-remote", label: "Remote Training" },
+] as const;
+
+const HEAD_NAV = [
+  { id: "head-data", label: "Data" },
+  { id: "head-augmentation", label: "Augmentation" },
+  { id: "head-optimization", label: "Optimization" },
+  { id: "head-model", label: "Model" },
+] as const;
+
+const BACKBONE_OPTIONS: { value: Backbone; label: string }[] = [
+  { value: "unet", label: "UNet" },
+  { value: "convnext", label: "ConvNeXt" },
+  { value: "swint", label: "Swin Transformer" },
+];
+
+// ── Searchable field registry ──────────────────────────────────────
+// Single source of truth for the search bar. Each entry's `id`, `label`
+// (and `hint`, where the field renders one) is the SAME metadata rendered
+// by the field below — Field/Toggle/SectionHeading rows spread the entry
+// ({...DEF}); custom multi-input rows attach `id={DEF.id}` to the row and
+// render `{DEF.label}` — so the index cannot silently drift from the UI.
+// A field is searchable iff it appears here AND its id is wired into the
+// JSX (rows carry `data-search-field` so tests can enforce both directions).
+// `keywords` add search synonyms; `conditional` marks fields that only
+// render for some model/head types. See tests/unit/trainingConfigSearch.test.tsx.
+export type SearchField = {
+  id: string;
+  label: string;
+  hint?: string;
+  keywords?: string;
+  conditional?: boolean;
+};
+
+const PIPELINE_FIELD_DEFS = {
+  secType: { id: "pipeline-type", label: "Pipeline Type" },
+  anchorPart: { id: "field-anchorpart", label: "Anchor Part", hint: "The body part used to center the crop around each animal. Choose one that is consistently visible and near the center of the animal.", conditional: true },
+  sigmaCentroids: { id: "field-sigma-centroid", label: "Sigma for Centroids", hint: "Gaussian spread for centroid confidence maps. Controls how wide the target peak is around each animal's center point.", keywords: "sigma", conditional: true },
+  sigmaNodes: { id: "field-sigma-nodes", label: "Sigma for Nodes", hint: "Gaussian spread for node confidence maps. Controls how wide the target peak is around each keypoint location.", keywords: "sigma" },
+  secInference: { id: "pipeline-inference", label: "Inference Target" },
+  inferenceTarget: { id: "field-inferencetarget", label: "Post-Training Inference Target", hint: "Which frames to run inference on after training completes. Predictions will be merged back into the project.", keywords: "inference target frames" },
+  skipUserLabeled: { id: "field-skipuserlabeled", label: "Skip user labeled frames", hint: "Exclude frames that already have user-created labels from the inference target." },
+  existingPredictions: { id: "field-existingpredictions", label: "Existing predictions", keywords: "clear all replace keep predictions" },
+  secPreproc: { id: "pipeline-preprocessing", label: "Pre-processing / Post-processing", keywords: "preprocessing postprocessing" },
+  convertColors: { id: "field-ensurechannels", label: "Convert Colors", hint: "Convert input images to a specific channel format. Use RGB for pretrained backbones or Grayscale for single-channel videos.", keywords: "ensure channels grayscale rgb" },
+  maxInstances: { id: "field-maxinstances", label: "Max Instances", hint: "Maximum number of animal instances to detect per frame. Leave empty or check 'No max' for no limit." },
+  filterOverlapping: { id: "field-filteroverlap", label: "Filter Overlapping Instances", keywords: "iou oks nms overlap" },
+  secPerformance: { id: "pipeline-performance", label: "Performance" },
+  dataPipeline: { id: "field-datapipeline", label: "Data Pipeline", hint: "How training data is loaded. 'Cache in Memory' is fastest but uses more RAM. 'Stream' reads from disk each epoch. 'Cache to Disk' saves processed data to disk.", keywords: "cache memory stream disk" },
+  dataloaderWorkers: { id: "field-dataloaderworkers", label: "Dataloader Workers", hint: "Number of parallel workers for loading training data. More workers = faster data loading but more CPU/memory usage. 0 = main thread only. Only takes effect with a caching pipeline (Cache in Memory / Cache to Disk); the Stream pipeline forces 0." },
+  accelerator: { id: "field-accelerator", label: "Accelerator", hint: "Hardware to use for training. 'Auto' detects available hardware. Use 'cuda' for NVIDIA GPUs, 'mps' for Apple Silicon, or 'cpu' for CPU-only (slow).", keywords: "gpu cuda mps cpu device hardware" },
+  numDevices: { id: "field-numdevices", label: "Number of Devices", hint: "Number of GPUs/devices to use for training. Set to 1 for single-GPU training.", keywords: "gpu devices" },
+  trainerStrategy: { id: "field-trainerstrategy", label: "Multi-GPU Strategy", hint: "Distributed-training strategy across multiple GPUs. 'auto' lets Lightning choose; 'ddp' (DistributedDataParallel) is the common multi-GPU default; 'fsdp' (Fully Sharded Data Parallel) shards model state for very large models. Only applies when Number of Devices > 1.", keywords: "gpu multi ddp fsdp strategy distributed parallel" },
+  secWandb: { id: "pipeline-wandb", label: "WandB", keywords: "weights and biases w&b logging" },
+  wandbEnable: { id: "field-wandb-enable", label: "Enable WandB for logging", hint: "Log training metrics, loss curves, and visualizations to Weights & Biases for experiment tracking.", keywords: "wandb w&b weights and biases" },
+  wandbOffline: { id: "field-wandb-offline", label: "Offline Mode", hint: "Log to local disk only — no network or W&B login required. Upload later with `wandb sync`.", keywords: "wandb w&b offline mode local sync network airgap" },
+  wandbApiKey: { id: "field-wandb-apikey", label: "API Key", hint: "W&B API key from wandb.ai/authorize. Optional — leave blank if you've run 'wandb login' or set the WANDB_API_KEY environment variable.", keywords: "wandb w&b api key token auth login" },
+  wandbUploadViz: { id: "field-wandb-uploadviz", label: "Upload Viz", hint: "Upload prediction visualization images to W&B for remote viewing.", keywords: "wandb w&b" },
+  wandbOpenBrowser: { id: "field-wandb-openbrowser", label: "Open in browser", hint: "Automatically open the W&B run page in your browser when training starts.", keywords: "wandb w&b" },
+  wandbEntity: { id: "field-wandb-entity", label: "Entity Name", keywords: "wandb w&b entity" },
+  wandbProject: { id: "field-wandb-project", label: "Project Name", keywords: "wandb w&b project" },
+  wandbRunId: { id: "field-wandb-runid", label: "Previous Run ID", keywords: "wandb w&b resume" },
+  wandbGroup: { id: "field-wandb-group", label: "Group Name", keywords: "wandb w&b" },
+  secEvaluation: { id: "pipeline-evaluation", label: "Evaluation" },
+  evalEnable: { id: "field-eval-enable", label: "Run evaluation during training", hint: "Run inference on validation frames at epoch intervals and compute pose metrics (mOKS, mAP, PCK). Useful for monitoring training quality beyond loss.", keywords: "evaluation metrics moks map pck" },
+  evalFrequency: { id: "field-eval-frequency", label: "Frequency (epochs)", keywords: "evaluation frequency epochs" },
+  evalOksStddev: { id: "field-eval-oksstddev", label: "OKS Std. Dev.", hint: "Object Keypoint Similarity standard deviation used when scoring evaluation predictions.", keywords: "evaluation oks stddev standard deviation" },
+  evalOksScale: { id: "field-eval-oksscale", label: "OKS Scale", hint: "Override the OKS scale used during evaluation. Leave empty to use the model's own scale.", keywords: "evaluation oks scale" },
+  evalMatchThreshold: { id: "field-eval-matchthreshold", label: "Match Threshold", hint: "Centroid models: max centroid distance in pixels to count as a match. Segmentation models: minimum mask IoU (0, 1].", keywords: "evaluation pck centroid distance match threshold iou" },
+  secOutput: { id: "pipeline-output", label: "Output" },
+  runName: { id: "field-runname", label: "Run Name", hint: "Name for this training run. Leave empty to auto-generate from timestamp and head type." },
+  runsFolder: { id: "field-runsfolder", label: "Runs Folder", hint: "Directory where the run folder and checkpoints will be created." },
+  checkpoint: { id: "field-checkpoint", label: "Checkpoint", hint: "Best Model saves the highest-scoring checkpoint(s) (by the Monitor metric). Latest Model also saves a last.ckpt after every checkpoint, useful for resuming training.", keywords: "best model latest model save" },
+  checkpointTopK: { id: "field-checkpoint-topk", label: "Keep Top N", hint: "How many of the best checkpoints to keep. -1 keeps all of them.", keywords: "save top k checkpoint retention count" },
+  checkpointMonitor: { id: "field-checkpoint-monitor", label: "Monitor", hint: "Metric name used to pick the \"best\" checkpoint(s), e.g. val/loss.", keywords: "checkpoint monitor metric" },
+  checkpointMode: { id: "field-checkpoint-mode", label: "Mode", hint: "Direction of improvement for the Monitor metric — Min for loss-like metrics, Max for accuracy-like metrics.", keywords: "checkpoint mode min max" },
+  visualization: { id: "field-visualization", label: "Visualization", hint: "Visualize Predictions saves sample prediction images each epoch (used by this app's epoch scrubber to review training progress). Keep Viz Images keeps that folder after training instead of deleting it; only has an effect when Visualize Predictions is on.", keywords: "visualize predictions keep viz images" },
+  exportFormat: { id: "field-export-format", label: "Export Model", hint: "Convert the trained model to a portable runtime after training completes, for faster inference. ONNX runs everywhere; TensorRT is NVIDIA-only (CUDA). The sleap-nn [export] support is installed automatically before training if you pick a format.", keywords: "export onnx tensorrt model convert runtime" },
+  useExportedForInference: { id: "field-use-exported-inference", label: "Use exported for inference", hint: "Run the post-training inference on the exported model instead of the PyTorch checkpoint. Falls back to the checkpoint automatically if the exported model fails to load or run.", keywords: "export onnx tensorrt inference runtime fallback" },
+  secRemote: { id: "pipeline-remote", label: "Remote Training" },
+} satisfies Record<string, SearchField>;
+
+const HEAD_FIELD_DEFS = {
+  secData: { id: "head-data", label: "Data" },
+  validationFraction: { id: "field-validationfraction", label: "Validation Fraction", hint: 'Fraction of labeled frames to use as a validation set. Ignored if "Overfit Mode" is enabled.', keywords: "val fraction split" },
+  overfitMode: { id: "field-overfitmode", label: "Overfit Mode (train=val)", hint: "If enabled, the same data will be used for both training and validation. This is useful for intentional overfitting on small datasets (fewer than 10 labeled frames) to test model capacity.", keywords: "overfit" },
+  randomSeed: { id: "field-randomseed", label: "Random Seed", keywords: "seed reproducible split" },
+  useNegativeFrames: { id: "field-usenegativeframes", label: "Use Negative Frames", hint: "If enabled, frames you explicitly marked as negative (background frames with no instances) are added to the training set. The model learns to predict nothing on them, reducing false positives on empty frames. Mark frames in the labeling window with Labels > Mark Frame as Negative (N). Has no effect for centered-instance and top-down-ID models.", keywords: "negative background empty frames false positives", conditional: true },
+  negativeLossWeight: { id: "field-negativelossweight", label: "Negative Loss Weight", hint: "Relative weight of the loss on negative (background) frames. 1.0 weights them the same as labeled frames; increase above 1.0 if false positives persist, or decrease below 1.0 to reduce their influence. Must be greater than 0. Only used when Use Negative Frames is enabled.", keywords: "negative background loss weight", conditional: true },
+  inputScaling: { id: "field-inputscaling", label: "Input Scaling", keywords: "scale rescale downsample input scale" },
+  cropSize: { id: "field-cropsize", label: "Crop Size", keywords: "crop bounding box", conditional: true },
+  secAugmentation: { id: "head-augmentation", label: "Augmentation" },
+  rotation: { id: "field-rotation", label: "Rotation", keywords: "augmentation angle rotate" },
+  scaleAug: { id: "field-scaleaug", label: "Scale", keywords: "scale augmentation" },
+  uniformNoise: { id: "field-uniformnoise", label: "Uniform Noise", keywords: "augmentation noise" },
+  gaussianNoise: { id: "field-gaussiannoise", label: "Gaussian Noise", keywords: "augmentation noise" },
+  contrast: { id: "field-contrast", label: "Contrast", keywords: "augmentation gamma" },
+  brightness: { id: "field-brightness", label: "Brightness", keywords: "augmentation" },
+  secOptimization: { id: "head-optimization", label: "Optimization" },
+  batchSize: { id: "field-batchsize", label: "Batch Size", hint: "Number of examples per minibatch. Higher numbers can increase generalization by averaging gradient updates over more examples, at the cost of more GPU memory. Lower numbers may lead to overfitting but can help optimization with few varied examples." },
+  maxEpochs: { id: "field-maxepochs", label: "Epochs", hint: "Maximum number of epochs to train for. Training can be stopped manually or automatically if early stopping is enabled and a plateau is detected.", keywords: "max epochs" },
+  learningRate: { id: "field-learningrate", label: "Initial Learning Rate", hint: "The initial learning rate for the optimizer. Typically 1e-3 or 1e-4. Can be decreased automatically with learning rate reduction on plateau. If too high or too low, training may fail to find good initial local minima.", keywords: "lr learning rate" },
+  lrSchedulerType: { id: "field-lrschedulertype", label: "LR Scheduler", hint: "How the learning rate changes over training. Reduce on Plateau lowers it when validation loss stalls; Step decays it on a fixed epoch schedule; the warmup schedulers ramp up then cosine/linearly decay it.", keywords: "learning rate scheduler step cosine warmup decay plateau" },
+  lrStepSize: { id: "field-lrscheduler-stepsize", label: "Step Size", keywords: "learning rate scheduler step lr", conditional: true },
+  lrGamma: { id: "field-lrscheduler-gamma", label: "Gamma", keywords: "learning rate scheduler step lr decay factor", conditional: true },
+  lrThreshold: { id: "field-lrscheduler-threshold", label: "Threshold", keywords: "learning rate scheduler reduce plateau" },
+  lrThresholdMode: { id: "field-lrscheduler-thresholdmode", label: "Threshold Mode", keywords: "learning rate scheduler reduce plateau rel abs" },
+  lrCooldown: { id: "field-lrscheduler-cooldown", label: "Cooldown", keywords: "learning rate scheduler reduce plateau" },
+  lrPatience: { id: "field-lrscheduler-patience", label: "LR Patience", keywords: "learning rate scheduler reduce plateau patience" },
+  lrFactor: { id: "field-lrscheduler-factor", label: "Factor", keywords: "learning rate scheduler reduce plateau" },
+  lrMinLR: { id: "field-lrscheduler-minlr", label: "Min LR", keywords: "learning rate scheduler reduce plateau minimum" },
+  lrCosineWarmupEpochs: { id: "field-lrscheduler-cosine-warmupepochs", label: "Warmup Epochs", keywords: "learning rate scheduler cosine annealing warmup", conditional: true },
+  lrCosineWarmupStartLR: { id: "field-lrscheduler-cosine-warmupstartlr", label: "Warmup Start LR", keywords: "learning rate scheduler cosine annealing warmup", conditional: true },
+  lrCosineEtaMin: { id: "field-lrscheduler-cosine-etamin", label: "Eta Min", keywords: "learning rate scheduler cosine annealing warmup minimum", conditional: true },
+  lrLinearWarmupEpochs: { id: "field-lrscheduler-linear-warmupepochs", label: "Warmup Epochs", keywords: "learning rate scheduler linear warmup decay", conditional: true },
+  lrLinearWarmupStartLR: { id: "field-lrscheduler-linear-warmupstartlr", label: "Warmup Start LR", keywords: "learning rate scheduler linear warmup decay", conditional: true },
+  lrLinearEndLR: { id: "field-lrscheduler-linear-endlr", label: "End LR", keywords: "learning rate scheduler linear warmup decay", conditional: true },
+  stopOnPlateau: { id: "field-stoponplateau", label: "Stop Training on Plateau", hint: "If enabled, training will terminate automatically when the validation loss plateaus. This saves time and compute, and prevents training into the overfitting regime.", keywords: "early stopping plateau" },
+  plateauMinDelta: { id: "field-plateaumindelta", label: "Plateau Min. Delta", hint: "Minimum absolute decrease in the loss in order to consider an epoch as not in a plateau.", keywords: "plateau min delta" },
+  plateauPatience: { id: "field-earlystopping", label: "Plateau Patience", hint: "Number of epochs without an improvement of at least min_delta in order for a plateau to be detected.", keywords: "early stopping patience plateau" },
+  onlineMining: { id: "field-onlinemining", label: "Online Mining", hint: "If enabled, online hard keypoint mining (OHKM) will compute loss per keypoint, sort from easy to hard, and scale hard keypoints to have higher weight. This encourages training to focus on tricky body parts. If disabled, all keypoints are weighted equally.", keywords: "ohkm hard keypoint mining" },
+  minHardKeypoints: { id: "field-minhardkeypoints", label: "Min Hard Keypoints", keywords: "ohkm mining online" },
+  maxHardKeypoints: { id: "field-maxhardkeypoints", label: "Max Hard Keypoints", keywords: "ohkm mining online" },
+  hardToEasyRatio: { id: "field-hardtoeasyratio", label: "Hard/Easy Ratio", keywords: "ohkm mining online ratio hard easy" },
+  lossScale: { id: "field-lossscale", label: "Loss Scale", keywords: "ohkm mining online loss scale" },
+  secModel: { id: "head-model", label: "Model" },
+  backbone: { id: "field-backbone", label: "Backbone", hint: "Select the backbone architecture. UNet is the default and works well for most cases. ConvNeXt and Swin Transformer can start from ImageNet-pretrained weights, which need RGB input.", keywords: "unet convnext swin architecture" },
+  backboneSize: { id: "field-backbonesize", label: "Model Size", hint: "Size of the ConvNeXt / Swin Transformer encoder. Larger sizes have more capacity but train slower and use more GPU memory. Tiny is a good default.", keywords: "convnext swin tiny small base large variant", conditional: true },
+  pretrainedWeights: { id: "field-pretrainedweights", label: "Pretrained Weights (ImageNet)", hint: "Initialize the encoder from torchvision's ImageNet weights (downloaded on first use). Usually trains faster and generalizes better than from scratch. Requires RGB input — grayscale videos are converted.", keywords: "pretrained imagenet weights transfer convnext swin", conditional: true },
+  stemStride: { id: "field-stemstride", label: "Stem Stride", keywords: "downsampling stride" },
+  maxStride: { id: "field-maxstride", label: "Max Stride", keywords: "downsampling receptive field stride" },
+  filters: { id: "field-filters", label: "Filters", keywords: "channels" },
+  filtersRate: { id: "field-filtersrate", label: "Filters Rate", keywords: "channels scale" },
+  middleBlock: { id: "field-middleblock", label: "Middle Block" },
+  upInterpolate: { id: "field-upinterpolate", label: "Up Interpolate", keywords: "bilinear upsampling" },
+  sigma: { id: "field-sigma", label: "Sigma", hint: "Spread of the Gaussian distribution of the confidence maps. Smaller values are more precise but harder to learn. Larger values are easier to learn but less precise. This spread is in units of pixels of the model input image (after any input scaling)." },
+  outputStride: { id: "field-outputstride", label: "Output Stride", keywords: "resolution downsample stride" },
+  confmapsLossWeight: { id: "field-confmapsweight", label: "Confmaps Loss Weight", keywords: "loss weight", conditional: true },
+  pafsLossWeight: { id: "field-pafsweight", label: "PAFs Loss Weight", keywords: "loss weight part affinity fields", conditional: true },
+  classVectorsLossWeight: { id: "field-classvectorsweight", label: "Class Vectors Loss Weight", keywords: "loss weight identity classification", conditional: true },
+  classMapsLossWeight: { id: "field-classmapsweight", label: "Class Maps Loss Weight", keywords: "loss weight identity classification", conditional: true },
+} satisfies Record<string, SearchField>;
+
+export type IndexedField = SearchField & { tab: "pipeline" | "head" };
+
+export const SEARCHABLE_FIELDS: IndexedField[] = [
+  ...Object.values(PIPELINE_FIELD_DEFS).map((f) => ({ ...f, tab: "pipeline" as const })),
+  ...Object.values(HEAD_FIELD_DEFS).map((f) => ({ ...f, tab: "head" as const })),
+];
+
+/**
+ * Case-insensitive match against label + hint + keywords. Every whitespace-
+ * separated token in the query must appear somewhere in the field's text, so
+ * multi-word queries ("wandb entity", "learning rate") match even when the
+ * words are not contiguous in the label/keyword list.
+ */
+export function fieldMatchesQuery(f: SearchField, query: string): boolean {
+  const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  const haystack = `${f.label} ${f.hint ?? ""} ${f.keywords ?? ""}`.toLowerCase();
+  return tokens.every((t) => haystack.includes(t));
+}
+
+// ── Shared components ──────────────────────────────────────────────
+
+function HintBubble({ text }: { text: string }) {
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  return (
+    <span className="relative">
+      <HelpCircle
+        className="h-3.5 w-3.5 text-muted-foreground/50 hover:text-muted-foreground cursor-help"
+        onMouseEnter={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          setPos({ x: rect.left + rect.width / 2, y: rect.top });
+        }}
+        onMouseLeave={() => setPos(null)}
+      />
+      {pos && createPortal(
+        <span
+          className="fixed z-[9999] px-3 py-2 text-xs bg-popover border rounded-md shadow-lg w-64 text-foreground leading-relaxed"
+          style={{ left: pos.x, top: pos.y - 8, transform: "translate(-50%, -100%)" }}
+        >
+          {text}
+        </span>,
+        document.body,
+      )}
+    </span>
+  );
+}
+
+function Field({ label, id, hint, children }: { label: string; id?: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <div id={id} data-search-field={id ? "" : undefined} className="flex items-center gap-6 py-2.5 scroll-mt-4">
+      <span className="text-sm text-muted-foreground shrink-0 flex items-center gap-1.5">
+        {label}
+        {hint && <HintBubble text={hint} />}
+      </span>
+      <div className="flex-1 min-w-0">{children}</div>
+    </div>
+  );
+}
+
+function Toggle({ label, id, hint, checked, onChange, disabled = false }: { label: string; id?: string; hint?: string; checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+  return (
+    <div id={id} data-search-field={id ? "" : undefined} className={`flex items-center gap-6 py-2.5 scroll-mt-4 ${disabled ? "opacity-50" : ""}`}>
+      <span className="text-sm text-muted-foreground shrink-0 flex items-center gap-1.5">
+        {label}
+        {hint && <HintBubble text={hint} />}
+      </span>
+      <button
+        disabled={disabled}
+        className={`w-10 h-6 rounded-full relative transition-colors ${checked ? "bg-primary" : "bg-zinc-700"} ${disabled ? "cursor-not-allowed" : ""}`}
+        onClick={() => onChange(!checked)}
+      >
+        <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${checked ? "translate-x-4" : ""}`} />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The top-down anchor-part picker, shown once above the centroid /
+ * centered-instance tab split (it's one concept — where to crop around each
+ * animal — not a per-head setting). Writes into the `centered_instance`
+ * slot's hyperparams, which is what actually gets serialized to
+ * `centered_instance.confmaps.anchor_part`.
+ */
+// Note: unlike the sidebar's AnchorPartField, this does NOT offer "pick from
+// canvas" — the video canvas is behind this modal dialog, so an interactive
+// canvas pick can't actually work here. Use the sidebar field for that.
+function PipelineAnchorPartField({
+  hp,
+  onUpdate,
+  skeletonNodes,
+  nodeVisibility,
+}: {
+  hp: ConfigHyperparams;
+  onUpdate: (updates: Partial<ConfigHyperparams>) => void;
+  skeletonNodes: string[];
+  nodeVisibility: Map<string, NodeVisibility>;
+}) {
+  return (
+    <div id={PIPELINE_FIELD_DEFS.anchorPart.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+        {PIPELINE_FIELD_DEFS.anchorPart.label}
+        <HintBubble text="The body part used to center the crop around each animal. Choose one that is consistently visible and near the center of the animal." />
+      </span>
+      <Select value={hp.anchorPart ?? "__auto__"} onValueChange={(v) => onUpdate({ anchorPart: v === "__auto__" ? null : v })}>
+        <SelectTrigger className="h-8 text-sm w-40"><SelectValue placeholder="Auto" /></SelectTrigger>
+        <SelectContent>
+          <SelectItem value="__auto__">Auto (bbox center)</SelectItem>
+          {skeletonNodes.map((n) => {
+            const vis = nodeVisibility.get(n);
+            return (
+              <SelectItem key={n} value={n}>
+                <span className="flex items-center gap-1.5">
+                  {n}
+                  {vis && vis.total > 0 && (
+                    <span className={`text-xs ${VISIBILITY_COLOR[visibilityTier(vis.pct)]}`}>
+                      {vis.pct}%
+                    </span>
+                  )}
+                </span>
+              </SelectItem>
+            );
+          })}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function SectionHeading({ id, label }: { id: string; label: string }) {
+  return (
+    <h3 id={id} data-search-field="" className="text-base font-medium pt-6 pb-3 first:pt-0 scroll-mt-4">
+      {label}
+    </h3>
+  );
+}
+
+// ── Per-head tab content ───────────────────────────────────────────
+
+function HeadTabContent({
+  slot,
+  modelType,
+  configFile,
+  hp,
+  onUpdate,
+  scrollRefCallback,
+  labelsOverride,
+  remoteFrame,
+  configActions,
+  mode = "project",
+}: {
+  slot: string;
+  modelType: ModelType;
+  configFile: ConfigFile | undefined;
+  hp: ConfigHyperparams;
+  onUpdate: (updates: Partial<ConfigHyperparams>) => void;
+  scrollRefCallback: (el: HTMLDivElement | null) => void;
+  labelsOverride?: Labels;
+  remoteFrame?: (videoIndex: number, frameIdx: number) => Promise<PreviewFrame>;
+  configActions?: Pick<TrainingConfigActions, "addConfigFile" | "updateConfigCheckpointPath">;
+  mode?: "project" | "worker-file";
+}) {
+  const headType = slotToHeadType(modelType, slot);
+  const baselineProfiles = getBaselineProfilesForHead(headType);
+  // Detectors and centroid models see the whole frame: no crop.
+  const showCropSize = slot !== "centroid" && slot !== "bbox";
+  const showNegativeFrames = usesNegativeFrames(headType);
+  const setSizeDistributionDialogOpen = useAppStore((s) => s.setSizeDistributionDialogOpen);
+  const storeLabels = useAppStore((s) => s.labels);
+  const labels = labelsOverride ?? storeLabels;
+  const sizeStats = useMemo(() => computeInstanceSizeStats(labels), [labels]);
+  const isPretrainedBackbone = !!hp.backbone && hp.backbone !== "unet";
+  const recommendedMaxStride = isPretrainedBackbone
+    ? 32
+    : sizeStats
+      ? recommendMaxStride(sizeStats.avgAnimalSize, sizeStats.maxBboxDim, hp.scale, hp.backbone)
+      : 16;
+  const effectiveMaxStride = hp.maxStride ?? recommendedMaxStride;
+  const backboneRecommendation = sizeStats
+    ? recommendBackboneProfile(sizeStats.maxBboxDim, sizeStats.maxFrameDim)
+    : null;
+  // recommendCentroidScale handles a null avgBboxDim itself (e.g. a
+  // single-keypoint skeleton has no bounding box to measure) by defaulting
+  // to the standard 0.5 — always call it, so the reasoning hint below still
+  // explains why, instead of silently showing nothing.
+  const centroidScaleRecommendation = recommendCentroidScale(
+    sizeStats?.avgBboxDim ?? null,
+    sizeStats?.maxFrameDim ?? 0,
+  );
+  const effectiveInputChannels = resolveInputChannels(hp.colorMode, detectVideoChannels(labels));
+  // The real Auto crop size (padding-aware), so unchecking "Auto" seeds the
+  // value the user was just looking at instead of an arbitrary fallback.
+  const effectiveCropSize = useMemo(
+    () => resolveEffectiveCropSize(labels, hp).cropSize,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [labels, hp.cropSize, hp.maxStride, hp.scale, hp.rotationPreset, hp.rotationCustomAngle, hp.scaleEnabled, hp.scaleMax],
+  );
+  const cropWarnings = useMemo(
+    () => cropSizeWarnings(headType, hp, labels),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [headType, labels, hp.cropSize, hp.maxStride, hp.scale, hp.rotationPreset, hp.rotationCustomAngle, hp.scaleEnabled, hp.scaleMax, hp.backbone],
+  );
+  const noNegativeFramesWarning = useMemo(
+    () => (showNegativeFrames ? negativeFramesWarning(hp.useNegativeFrames, labels) : null),
+    [showNegativeFrames, hp.useNegativeFrames, labels],
+  );
+  const trainingMode = hp.trainingMode ?? "reuse_config";
+  const modelLocked = trainingMode === "resume" || trainingMode === "finetune";
+  const allLocked = trainingMode === "resume";
+  const {
+    parseYamlConfig,
+    addConfigFile: storeAddConfigFile,
+    updateConfigCheckpointPath: storeUpdateConfigCheckpointPath,
+  } = useTrainingStore();
+  const addConfigFile = configActions?.addConfigFile ?? storeAddConfigFile;
+  const updateConfigCheckpointPath =
+    configActions?.updateConfigCheckpointPath ?? storeUpdateConfigCheckpointPath;
+
+  const handleBrowseCheckpoint = async () => {
+    try {
+      const { open: tauriOpen } = await import("@tauri-apps/plugin-dialog");
+      const selected = await tauriOpen({
+        title: "Select Checkpoint File",
+        filters: [
+          trainingMode === "finetune"
+            ? { name: "Checkpoint", extensions: ["ckpt", "h5"] }
+            : { name: "Checkpoint", extensions: ["ckpt"] },
+        ],
+      });
+      if (!selected) return;
+      const checkpointPath = selected as string;
+
+      // Warn (but don't block, mirroring handleConfigBrowse's modelType check
+      // below) if the checkpoint's own head type — read from its sibling
+      // training_config.yaml, sleap-nn's standard run layout — doesn't match
+      // this slot's head. A backbone/head-shape mismatch would otherwise only
+      // surface as an opaque state_dict error once training starts.
+      try {
+        const [{ dirname, join }, { readTextFile, exists }, { parseTrainingConfig }] = await Promise.all([
+          import("@tauri-apps/api/path"),
+          import("@tauri-apps/plugin-fs"),
+          import("@/lib/metrics/loadModelMetrics"),
+        ]);
+        const runDir = await dirname(checkpointPath);
+        const cfgPath = await join(runDir, "training_config.yaml");
+        if (await exists(cfgPath)) {
+          const info = parseTrainingConfig(await readTextFile(cfgPath));
+          if (info.headKey && !headTypeMatches(headType, { headKey: info.headKey })) {
+            toast.warning("Possible checkpoint head mismatch", {
+              description: `The checkpoint you selected was trained for "${info.headKey}" and may not be compatible with this ${headType} head.`,
+            });
+          }
+        }
+      } catch {
+        // Sibling config unreadable/missing — nothing to validate against.
+      }
+
+      updateConfigCheckpointPath(slot, checkpointPath);
+    } catch {
+      // User cancelled or not in Tauri
+    }
+  };
+
+  const handleConfigBrowse = () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".yaml,.yml";
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const text = reader.result as string;
+          const parsed = parseYamlConfig(text, file.name, slot);
+          if (parsed) {
+            if (parsed.modelType !== slot && parsed.modelType !== "unknown") {
+              toast.error("Wrong model type", {
+                description: `The file you selected was a training config for ${parsed.modelType} and cannot be used for ${slot}.`,
+              });
+            }
+            addConfigFile(parsed);
+          } else {
+            toast.error("The file you selected was not a valid training config.");
+          }
+        };
+        reader.readAsText(file);
+      }
+    };
+    input.click();
+  };
+
+  return (
+    <div ref={scrollRefCallback} className="h-full overflow-y-auto px-8 py-6 bg-muted/20">
+      {/* ── Config file selector (dropdown like PyQt) ── */}
+      <div className="mb-5 pb-4 border-b">
+        <Select
+          value={configFile ? configFile.filename : ""}
+          onValueChange={(v) => {
+            if (v === "__browse__") {
+              handleConfigBrowse();
+            } else {
+              const baseline = baselineProfiles.find((p) => p.filename === v);
+              if (baseline) {
+                const parsed = parseYamlConfig(baseline.content, baseline.filename, slot);
+                if (parsed) addConfigFile(parsed);
+              }
+            }
+          }}
+        >
+          <SelectTrigger className="h-10 text-sm font-mono bg-background">
+            <SelectValue placeholder="Select training config file..." />
+          </SelectTrigger>
+          <SelectContent>
+            {baselineProfiles.map((p) => (
+              <SelectItem key={p.filename} value={p.filename}>
+                {p.label}
+              </SelectItem>
+            ))}
+            {configFile && !baselineProfiles.some((p) => p.filename === configFile.filename) && (
+              <SelectItem value={configFile.filename}>
+                {(() => {
+                  const runNameMatch = configFile.content.match(/run_name:\s*(.+)/);
+                  const runName = runNameMatch?.[1]?.trim();
+                  return runName && runName !== "null"
+                    ? `[Trained] ${runName} (${configFile.filename})`
+                    : `[${configFile.modelType}] (${configFile.filename})`;
+                })()}
+              </SelectItem>
+            )}
+            {mode !== "worker-file" && (
+              <SelectItem value="__browse__" className="text-primary font-medium">
+                Browse for config file...
+              </SelectItem>
+            )}
+          </SelectContent>
+        </Select>
+        {(() => {
+          if (!backboneRecommendation || !configFile || baselineProfiles.length <= 1) return null;
+          const isLarge = configFile.filename.includes("large_rf");
+          const isMedium = configFile.filename.includes("medium_rf");
+          if (!isLarge && !isMedium) return null; // not an RF-tiered profile (e.g. multi-class)
+          if ((backboneRecommendation.tier === "large") === isLarge) return null;
+          return (
+            <p className="text-[10px] text-muted-foreground mt-1.5">
+              <Lightbulb className="mr-1 inline h-3 w-3 align-[-2px]" />Recommended: {backboneRecommendation.tier === "large" ? "Large RF" : "Medium RF"} — {backboneRecommendation.reason}
+            </p>
+          );
+        })()}
+      </div>
+
+      {/* ── Training mode ── */}
+      {configFile && (
+        <div className="mb-5 pb-4 border-b">
+          <div className="flex items-center gap-5">
+            {([
+              { value: "reuse_config" as const, label: "Train from scratch" },
+              { value: "finetune" as const, label: "Fine-tune (start from prior weights)" },
+              { value: "resume" as const, label: "Resume training (continue from checkpoint)" },
+            ]).map((opt) => (
+              <label key={opt.value} className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="radio"
+                  name={`training-mode-${slot}`}
+                  checked={trainingMode === opt.value}
+                  onChange={() => onUpdate({ trainingMode: opt.value })}
+                  className="accent-primary"
+                />
+                <span className="text-sm">{opt.label}</span>
+              </label>
+            ))}
+          </div>
+
+          {(trainingMode === "finetune" || trainingMode === "resume") && (
+            <div className="mt-3 space-y-1">
+              <div className="flex items-center gap-2">
+                <Input
+                  value={configFile.checkpointPath ?? ""}
+                  onChange={(e) => updateConfigCheckpointPath(slot, e.target.value || null)}
+                  placeholder={trainingMode === "finetune" ? "Path to .ckpt or .h5 file" : "Path to .ckpt file"}
+                  className="h-9 text-sm font-mono flex-1"
+                />
+                {isTauri && mode !== "worker-file" && (
+                  <button
+                    type="button"
+                    onClick={handleBrowseCheckpoint}
+                    className="h-9 px-3 text-sm rounded-md border hover:bg-muted shrink-0"
+                  >
+                    Browse...
+                  </button>
+                )}
+              </div>
+              {trainingMode === "resume" &&
+                configFile.checkpointPath &&
+                !configFile.checkpointPath.toLowerCase().endsWith(".ckpt") && (
+                  <p className="text-[10px] text-destructive">
+                    Resume training requires a .ckpt file (.h5 is only supported for Fine-tune).
+                  </p>
+                )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Model Stats Preview (thumbnail + RF + crop size + params) ── */}
+      <ModelStatsPreview hp={hp} maxStride={effectiveMaxStride} filters={hp.filters} filtersRate={hp.filtersRate} outputStride={hp.outputStride} stemStride={hp.stemStride} backbone={hp.backbone || "unet"} inputChannels={effectiveInputChannels} slot={slot} labels={labels} remoteFrame={remoteFrame} />
+
+      {/* ── 1. Data ── */}
+      <div className={allLocked ? "opacity-40 pointer-events-none" : ""}>
+      <SectionHeading {...HEAD_FIELD_DEFS.secData} />
+      <div className="space-y-2">
+        <div className={hp.overfitMode ? "opacity-50" : ""}>
+          <Field {...HEAD_FIELD_DEFS.validationFraction}>
+            <NumberInput min={0} max={1} value={hp.validationFraction} onCommit={(n) => onUpdate({ validationFraction: n })} step={0.05} className="h-9 text-sm" disabled={hp.overfitMode} />
+          </Field>
+        </div>
+        <div className="flex items-center gap-6">
+          <Toggle {...HEAD_FIELD_DEFS.overfitMode} checked={hp.overfitMode} onChange={(v) => onUpdate({ overfitMode: v })} />
+        </div>
+        {showNegativeFrames && (
+          <>
+            <Toggle {...HEAD_FIELD_DEFS.useNegativeFrames} checked={hp.useNegativeFrames} onChange={(v) => onUpdate({ useNegativeFrames: v })} />
+            {noNegativeFramesWarning && (
+              <div role="alert" className="rounded-md border border-orange-500/50 bg-orange-500/10 px-3 py-2 text-xs text-orange-700 dark:text-orange-300">
+                <AlertTriangle className="mr-1 inline h-3.5 w-3.5 align-[-3px]" />
+                {noNegativeFramesWarning}
+              </div>
+            )}
+            <div className={hp.useNegativeFrames ? "" : "opacity-50"}>
+              <Field {...HEAD_FIELD_DEFS.negativeLossWeight}>
+                <NumberInput min={0.01} max={100} value={hp.negativeLossWeight} onCommit={(n) => onUpdate({ negativeLossWeight: n })} step={0.1} className="h-9 text-sm" disabled={!hp.useNegativeFrames} />
+              </Field>
+            </div>
+          </>
+        )}
+        <div className="flex items-center gap-4 flex-wrap">
+          <div id={HEAD_FIELD_DEFS.randomSeed.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+            <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {HEAD_FIELD_DEFS.randomSeed.label}
+              <HintBubble text="Random seed for reproducible train/validation data splits. Leave empty (Auto) for random seed each run." />
+            </span>
+            <NumberInput min={0} integer nullable value={hp.randomSeed} onCommit={(n) => onUpdate({ randomSeed: n })} disabled={hp.randomSeed === null} placeholder="0" className="h-8 text-sm w-20" />
+          </div>
+          <label className="flex items-center gap-1.5 cursor-pointer">
+            <input type="checkbox" checked={hp.randomSeed === null} onChange={(e) => onUpdate({ randomSeed: e.target.checked ? null : 0 })} className="accent-primary" />
+            <span className="text-sm">Auto</span>
+          </label>
+        </div>
+        <Field {...HEAD_FIELD_DEFS.inputScaling} hint="Rescaling factor applied to input images before training. Values less than 1.0 downsample the image, which reduces memory usage and speeds up training at the cost of spatial resolution. Note that crop size and sigma values are relative to the scaled image.">
+          <NumberInput min={0.01} value={hp.scale} onCommit={(n) => onUpdate({ scale: n })} step={0.125} className="h-9 text-sm" />
+        </Field>
+        {slot === "centroid" && centroidScaleRecommendation && (
+          <p className="text-[10px] text-green-400 -mt-1 pl-1">
+            <Lightbulb className="mr-1 inline h-3 w-3 align-[-2px]" />
+            {hp.scale === centroidScaleRecommendation.scale
+              ? `${centroidScaleRecommendation.scale}× recommended — ${centroidScaleRecommendation.reason}`
+              : `Recommended: ${centroidScaleRecommendation.scale}× — ${centroidScaleRecommendation.reason}`}
+          </p>
+        )}
+        {showCropSize && (
+          <>
+            <div className="flex items-center gap-4">
+              <Field {...HEAD_FIELD_DEFS.cropSize} hint="Bounding box crop size around each instance in pixels. Set to 'Auto' to compute from the data (largest instance bounding box, padded for rotation/scale augmentation, aligned to max_stride).">
+                <NumberInput
+                  integer
+                  min={32}
+                  max={1024}
+                  value={hp.cropSize ?? effectiveCropSize ?? null}
+                  // Not nullable: only the explicit "Auto" checkbox below sets
+                  // cropSize:null, never a momentarily empty box mid-edit.
+                  onCommit={(n) => onUpdate({ cropSize: n })}
+                  disabled={hp.cropSize === null}
+                  className="h-9 text-sm"
+                />
+              </Field>
+              <label className="flex items-center gap-1.5 cursor-pointer shrink-0">
+                <input type="checkbox" checked={hp.cropSize === null} onChange={(e) => onUpdate({ cropSize: e.target.checked ? null : (effectiveCropSize ?? 256) })} className="accent-primary" />
+                <span className="text-sm">Auto</span>
+              </label>
+              {isCropHead(headType) && labels && mode !== "worker-file" && (
+                <button
+                  type="button"
+                  onClick={() => setSizeDistributionDialogOpen(true)}
+                  title="View the distribution of instance sizes and identify outliers"
+                  className="h-9 px-3 text-sm rounded-md border hover:bg-muted shrink-0"
+                >
+                  Analyze Sizes...
+                </button>
+              )}
+            </div>
+            {cropWarnings.length > 0 && (
+              <div role="alert" className="rounded-md border border-orange-500/50 bg-orange-500/10 px-3 py-2 text-xs text-orange-700 dark:text-orange-300 space-y-1">
+                {cropWarnings.map((w) => (
+                  <p key={w}>
+                    <AlertTriangle className="mr-1 inline h-3.5 w-3.5 align-[-3px]" />
+                    {w}
+                  </p>
+                ))}
+              </div>
+            )}
+            {hp.cropSize === null && sizeStats && (
+              <p className="text-[10px] text-muted-foreground pl-1">
+                <Lightbulb className="mr-1 inline h-3 w-3 align-[-2px]" />Auto: padded for ±{hp.rotationPreset === "custom" ? hp.rotationCustomAngle : hp.rotationPreset === "off" ? 0 : hp.rotationPreset}° rotation
+                {hp.scaleEnabled ? ` and ${hp.scaleMax}× scale` : ""} augmentation.
+              </p>
+            )}
+          </>
+        )}
+      </div>
+
+      </div>
+
+      <Separator className="my-5" />
+
+      {/* ── 2. Augmentation ── */}
+      <div className={allLocked ? "opacity-40 pointer-events-none" : ""}>
+      <SectionHeading {...HEAD_FIELD_DEFS.secAugmentation} />
+      <div className="space-y-2">
+        {/* Rotation */}
+        <div id={HEAD_FIELD_DEFS.rotation.id} data-search-field="" className="flex items-center gap-2 mb-2 scroll-mt-4">
+          <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+            {HEAD_FIELD_DEFS.rotation.label}
+            <HintBubble text="Rotation augmentation range. Off: disabled. ±15°: for side-view cameras where upside-down would be unnatural. ±180°: for top-view/overhead cameras where all orientations are valid." />
+          </span>
+          <Select value={hp.rotationPreset} onValueChange={(v) => onUpdate({ rotationPreset: v as "off" | "15" | "180" | "custom" })}>
+            <SelectTrigger className="h-8 text-sm w-28"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="off">Off</SelectItem>
+              <SelectItem value="15">&plusmn;15&deg;</SelectItem>
+              <SelectItem value="180">&plusmn;180&deg;</SelectItem>
+              <SelectItem value="custom">Custom</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        {hp.rotationPreset === "custom" && (
+          <div className="flex items-center gap-2 pl-6 mb-2">
+            <span className="text-sm text-muted-foreground">Angle (&plusmn;&deg;)</span>
+            <NumberInput min={1} max={180} value={hp.rotationCustomAngle} onCommit={(n) => onUpdate({ rotationCustomAngle: n })} step={1} className="h-8 text-sm w-20" />
+          </div>
+        )}
+
+        {/* Scale */}
+        <div className="space-y-2">
+          <label id={HEAD_FIELD_DEFS.scaleAug.id} data-search-field="" className="flex items-center gap-1.5 cursor-pointer scroll-mt-4">
+            <input type="checkbox" checked={hp.scaleEnabled} onChange={(e) => onUpdate({ scaleEnabled: e.target.checked })} className="accent-primary" />
+            <span className="text-sm flex items-center gap-1">{HEAD_FIELD_DEFS.scaleAug.label} <HintBubble text="Enable random scaling augmentation. Scaling is applied independently with 100% probability when enabled." /></span>
+          </label>
+          {hp.scaleEnabled && (
+            <div className="flex items-center gap-4 pl-6">
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Scale Min</span>
+                <NumberInput min={0.01} value={hp.scaleMin} onCommit={(n) => onUpdate({ scaleMin: n })} step={0.05} className="h-8 text-sm w-20" />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Scale Max</span>
+                <NumberInput min={0.01} value={hp.scaleMax} onCommit={(n) => onUpdate({ scaleMax: n })} step={0.05} className="h-8 text-sm w-20" />
+              </div>
+            </div>
+          )}
+
+          {/* Uniform Noise */}
+          <label id={HEAD_FIELD_DEFS.uniformNoise.id} data-search-field="" className="flex items-center gap-1.5 cursor-pointer scroll-mt-4">
+            <input type="checkbox" checked={hp.uniformNoiseEnabled} onChange={(e) => onUpdate({ uniformNoiseEnabled: e.target.checked })} className="accent-primary" />
+            <span className="text-sm flex items-center gap-1">{HEAD_FIELD_DEFS.uniformNoise.label} <HintBubble text="Enable uniformly distributed noise augmentation." /></span>
+          </label>
+          {hp.uniformNoiseEnabled && (
+            <div className="flex items-center gap-4 pl-6">
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Min Val</span>
+                <NumberInput min={0} max={1} value={hp.uniformNoiseMin} onCommit={(n) => onUpdate({ uniformNoiseMin: n })} step={0.01} className="h-8 text-sm w-20" />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Max Val</span>
+                <NumberInput min={0} max={1} value={hp.uniformNoiseMax} onCommit={(n) => onUpdate({ uniformNoiseMax: n })} step={0.01} className="h-8 text-sm w-20" />
+              </div>
+            </div>
+          )}
+
+          {/* Gaussian Noise */}
+          <label id={HEAD_FIELD_DEFS.gaussianNoise.id} data-search-field="" className="flex items-center gap-1.5 cursor-pointer scroll-mt-4">
+            <input type="checkbox" checked={hp.gaussianNoiseEnabled} onChange={(e) => onUpdate({ gaussianNoiseEnabled: e.target.checked })} className="accent-primary" />
+            <span className="text-sm flex items-center gap-1">{HEAD_FIELD_DEFS.gaussianNoise.label} <HintBubble text="Enable normally distributed noise augmentation. This is applied independently to each pixel." /></span>
+          </label>
+          {hp.gaussianNoiseEnabled && (
+            <div className="flex items-center gap-4 pl-6">
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Mean</span>
+                <NumberInput value={hp.gaussianNoiseMean} onCommit={(n) => onUpdate({ gaussianNoiseMean: n })} step={0.01} className="h-8 text-sm w-20" />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Std Dev</span>
+                <NumberInput min={0} value={hp.gaussianNoiseStd} onCommit={(n) => onUpdate({ gaussianNoiseStd: n })} step={0.01} className="h-8 text-sm w-20" />
+              </div>
+            </div>
+          )}
+
+          {/* Contrast */}
+          <label id={HEAD_FIELD_DEFS.contrast.id} data-search-field="" className="flex items-center gap-1.5 cursor-pointer scroll-mt-4">
+            <input type="checkbox" checked={hp.contrastEnabled} onChange={(e) => onUpdate({ contrastEnabled: e.target.checked })} className="accent-primary" />
+            <span className="text-sm flex items-center gap-1">{HEAD_FIELD_DEFS.contrast.label} <HintBubble text="Enable gamma contrast adjustment. This scales all pixel values by x^gamma where x is in [0, 1]." /></span>
+          </label>
+          {hp.contrastEnabled && (
+            <div className="flex items-center gap-4 pl-6">
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Contrast Min</span>
+                <NumberInput min={0} value={hp.contrastMin} onCommit={(n) => onUpdate({ contrastMin: n })} step={0.05} className="h-8 text-sm w-20" />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Contrast Max</span>
+                <NumberInput min={0} value={hp.contrastMax} onCommit={(n) => onUpdate({ contrastMax: n })} step={0.05} className="h-8 text-sm w-20" />
+              </div>
+            </div>
+          )}
+
+          {/* Brightness */}
+          <label id={HEAD_FIELD_DEFS.brightness.id} data-search-field="" className="flex items-center gap-1.5 cursor-pointer scroll-mt-4">
+            <input type="checkbox" checked={hp.brightnessEnabled} onChange={(e) => onUpdate({ brightnessEnabled: e.target.checked })} className="accent-primary" />
+            <span className="text-sm flex items-center gap-1">{HEAD_FIELD_DEFS.brightness.label} <HintBubble text="Enable brightness augmentation. This adds the same value to all pixels to simulate illumination change." /></span>
+          </label>
+          {hp.brightnessEnabled && (
+            <div className="flex items-center gap-4 pl-6">
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Brightness Min</span>
+                <NumberInput value={hp.brightnessMin} onCommit={(n) => onUpdate({ brightnessMin: n })} step={0.01} className="h-8 text-sm w-20" />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">Brightness Max</span>
+                <NumberInput value={hp.brightnessMax} onCommit={(n) => onUpdate({ brightnessMax: n })} step={0.01} className="h-8 text-sm w-20" />
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      </div>
+
+      <Separator className="my-5" />
+
+      {/* ── 3. Optimization ── */}
+      <div className={allLocked ? "opacity-40 pointer-events-none" : ""}>
+      <SectionHeading {...HEAD_FIELD_DEFS.secOptimization} />
+      <div className="space-y-2">
+        <Field {...HEAD_FIELD_DEFS.batchSize}>
+          <NumberInput min={1} max={512} integer value={hp.batchSize} onCommit={(n) => onUpdate({ batchSize: n })} className="h-9 text-sm" />
+        </Field>
+        <Field {...HEAD_FIELD_DEFS.maxEpochs}>
+          <NumberInput min={1} max={1000} integer value={hp.maxEpochs} onCommit={(n) => onUpdate({ maxEpochs: n })} className="h-9 text-sm" />
+        </Field>
+        <Field {...HEAD_FIELD_DEFS.learningRate}>
+          <NumberInput min={0} value={hp.learningRate} onCommit={(n) => onUpdate({ learningRate: n })} step={0.0001} className="h-9 text-sm" />
+        </Field>
+        <Field {...HEAD_FIELD_DEFS.lrSchedulerType}>
+          <Select value={hp.lrSchedulerType} onValueChange={(v) => onUpdate({ lrSchedulerType: v as ConfigHyperparams["lrSchedulerType"] })}>
+            <SelectTrigger className="h-9 text-sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="reduce_lr_on_plateau">Reduce on Plateau</SelectItem>
+              <SelectItem value="step_lr">Step</SelectItem>
+              <SelectItem value="cosine_annealing_warmup">Cosine Annealing Warmup</SelectItem>
+              <SelectItem value="linear_warmup_linear_decay">Linear Warmup + Decay</SelectItem>
+              <SelectItem value="none">None</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+        {hp.lrSchedulerType === "step_lr" && (
+          <div className="flex items-center gap-4 flex-wrap">
+            <div id={HEAD_FIELD_DEFS.lrStepSize.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrStepSize.label}</span>
+              <NumberInput min={1} integer value={hp.stepLRStepSize} onCommit={(n) => onUpdate({ stepLRStepSize: n })} className="h-8 text-sm w-20" />
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrGamma.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrGamma.label}</span>
+              <NumberInput min={0} value={hp.stepLRGamma} onCommit={(n) => onUpdate({ stepLRGamma: n })} step={0.01} className="h-8 text-sm w-20" />
+            </div>
+          </div>
+        )}
+        {hp.lrSchedulerType === "reduce_lr_on_plateau" && (
+          <div className="flex items-center gap-4 flex-wrap">
+            <div id={HEAD_FIELD_DEFS.lrThreshold.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrThreshold.label}</span>
+              <NumberInput min={0} value={hp.reduceLRThreshold} onCommit={(n) => onUpdate({ reduceLRThreshold: n })} className="h-8 text-sm w-20" />
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrThresholdMode.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrThresholdMode.label}</span>
+              <Select value={hp.reduceLRThresholdMode} onValueChange={(v) => onUpdate({ reduceLRThresholdMode: v as "rel" | "abs" })}>
+                <SelectTrigger className="h-8 text-sm w-20"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="abs">abs</SelectItem>
+                  <SelectItem value="rel">rel</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrCooldown.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrCooldown.label}</span>
+              <NumberInput min={0} integer value={hp.reduceLRCooldown} onCommit={(n) => onUpdate({ reduceLRCooldown: n })} className="h-8 text-sm w-16" />
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrPatience.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrPatience.label}</span>
+              <NumberInput min={0} integer value={hp.reduceLRPatience} onCommit={(n) => onUpdate({ reduceLRPatience: n })} className="h-8 text-sm w-16" />
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrFactor.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrFactor.label}</span>
+              <NumberInput min={0} max={1} value={hp.reduceLRFactor} onCommit={(n) => onUpdate({ reduceLRFactor: n })} step={0.05} className="h-8 text-sm w-16" />
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrMinLR.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrMinLR.label}</span>
+              <NumberInput min={0} value={hp.reduceLRMinLR} onCommit={(n) => onUpdate({ reduceLRMinLR: n })} className="h-8 text-sm w-20" />
+            </div>
+          </div>
+        )}
+        {hp.lrSchedulerType === "cosine_annealing_warmup" && (
+          <div className="flex items-center gap-4 flex-wrap">
+            <div id={HEAD_FIELD_DEFS.lrCosineWarmupEpochs.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrCosineWarmupEpochs.label}</span>
+              <NumberInput min={0} integer value={hp.cosineWarmupEpochs} onCommit={(n) => onUpdate({ cosineWarmupEpochs: n })} className="h-8 text-sm w-16" />
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrCosineWarmupStartLR.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrCosineWarmupStartLR.label}</span>
+              <NumberInput min={0} value={hp.cosineWarmupStartLR} onCommit={(n) => onUpdate({ cosineWarmupStartLR: n })} step={0.0001} className="h-8 text-sm w-20" />
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrCosineEtaMin.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrCosineEtaMin.label}</span>
+              <NumberInput min={0} value={hp.cosineEtaMin} onCommit={(n) => onUpdate({ cosineEtaMin: n })} step={0.0001} className="h-8 text-sm w-20" />
+            </div>
+          </div>
+        )}
+        {hp.lrSchedulerType === "linear_warmup_linear_decay" && (
+          <div className="flex items-center gap-4 flex-wrap">
+            <div id={HEAD_FIELD_DEFS.lrLinearWarmupEpochs.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrLinearWarmupEpochs.label}</span>
+              <NumberInput min={0} integer value={hp.linearWarmupEpochs} onCommit={(n) => onUpdate({ linearWarmupEpochs: n })} className="h-8 text-sm w-16" />
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrLinearWarmupStartLR.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrLinearWarmupStartLR.label}</span>
+              <NumberInput min={0} value={hp.linearWarmupStartLR} onCommit={(n) => onUpdate({ linearWarmupStartLR: n })} step={0.0001} className="h-8 text-sm w-20" />
+            </div>
+            <div id={HEAD_FIELD_DEFS.lrLinearEndLR.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+              <span className="text-sm text-muted-foreground">{HEAD_FIELD_DEFS.lrLinearEndLR.label}</span>
+              <NumberInput min={0} value={hp.linearEndLR} onCommit={(n) => onUpdate({ linearEndLR: n })} step={0.0001} className="h-8 text-sm w-20" />
+            </div>
+          </div>
+        )}
+        <Toggle {...HEAD_FIELD_DEFS.stopOnPlateau} checked={hp.stopOnPlateau} onChange={(v) => onUpdate({ stopOnPlateau: v })} />
+        <Field {...HEAD_FIELD_DEFS.plateauMinDelta}>
+          <NumberInput min={0} value={hp.plateauMinDelta} onCommit={(n) => onUpdate({ plateauMinDelta: n })} disabled={!hp.stopOnPlateau} className="h-9 text-sm" />
+        </Field>
+        <Field {...HEAD_FIELD_DEFS.plateauPatience}>
+          <NumberInput min={1} integer value={hp.earlyStoppingPatience} onCommit={(n) => onUpdate({ earlyStoppingPatience: n })} disabled={!hp.stopOnPlateau} className="h-9 text-sm" />
+        </Field>
+        <Toggle {...HEAD_FIELD_DEFS.onlineMining} checked={hp.onlineMining} onChange={(v) => onUpdate({ onlineMining: v })} />
+        <div className={`flex items-center gap-4 flex-wrap ${!hp.onlineMining ? "opacity-50" : ""}`}>
+          <div id={HEAD_FIELD_DEFS.minHardKeypoints.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+            <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {HEAD_FIELD_DEFS.minHardKeypoints.label}
+              <HintBubble text="The minimum number of keypoints that will be considered as 'hard', even if they are not below the hard_to_easy_ratio." />
+            </span>
+            <NumberInput min={1} integer value={hp.minHardKeypoints} onCommit={(n) => onUpdate({ minHardKeypoints: n })} disabled={!hp.onlineMining} className="h-8 text-sm w-16" />
+          </div>
+          <div id={HEAD_FIELD_DEFS.maxHardKeypoints.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+            <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {HEAD_FIELD_DEFS.maxHardKeypoints.label}
+              <HintBubble text="The maximum number of hard keypoints to apply scaling to. This can help when there are few very easy keypoints which may skew the ratio." />
+            </span>
+            <NumberInput min={1} integer nullable value={hp.maxHardKeypoints} onCommit={(n) => onUpdate({ maxHardKeypoints: n })} disabled={!hp.onlineMining} placeholder="None" className="h-8 text-sm w-16" />
+          </div>
+          <div id={HEAD_FIELD_DEFS.hardToEasyRatio.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+            <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {HEAD_FIELD_DEFS.hardToEasyRatio.label}
+              <HintBubble text="The minimum ratio of an individual keypoint's loss to the lowest keypoint loss for it to be considered 'hard'. This helps switch focus across groups of keypoints during training." />
+            </span>
+            <NumberInput min={0} value={hp.hardToEasyRatio} onCommit={(n) => onUpdate({ hardToEasyRatio: n })} disabled={!hp.onlineMining} step={0.5} className="h-8 text-sm w-16" />
+          </div>
+          <div id={HEAD_FIELD_DEFS.lossScale.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+            <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {HEAD_FIELD_DEFS.lossScale.label}
+              <HintBubble text="Factor by which the hard keypoints' losses are scaled up in the total loss." />
+            </span>
+            <NumberInput min={0} value={hp.lossScale} onCommit={(n) => onUpdate({ lossScale: n })} disabled={!hp.onlineMining} step={0.5} className="h-8 text-sm w-16" />
+          </div>
+        </div>
+      </div>
+      </div>
+
+      <Separator className="my-5" />
+
+      {/* ── 4. Model ── */}
+      <div className={modelLocked ? "opacity-40 pointer-events-none" : ""}>
+      <SectionHeading {...HEAD_FIELD_DEFS.secModel} />
+      <div className="space-y-2">
+        <Field {...HEAD_FIELD_DEFS.backbone}>
+          <Select
+            value={hp.backbone || ""}
+            onValueChange={(v) => {
+              const backbone = v as Backbone;
+              // ImageNet weights for ConvNeXt/SwinT expect 3-channel input —
+              // nudge Convert Colors to RGB the moment one is picked with
+              // pretrained weights on (still freely overridable afterward).
+              const needsRgb = (backbone === "convnext" || backbone === "swint") && hp.pretrainedWeights;
+              onUpdate(needsRgb ? { backbone, colorMode: "rgb" as ColorMode } : { backbone });
+            }}
+          >
+            <SelectTrigger className="h-9 text-sm"><SelectValue placeholder="From config..." /></SelectTrigger>
+            <SelectContent>
+              {BACKBONE_OPTIONS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </Field>
+        {(hp.backbone === "convnext" || hp.backbone === "swint") && (
+          <>
+            <Field {...HEAD_FIELD_DEFS.backboneSize}>
+              <Select
+                value={resolveBackboneSize(hp.backbone, hp.backboneSize)}
+                onValueChange={(v) => onUpdate({ backboneSize: v as BackboneSize })}
+              >
+                <SelectTrigger className="h-9 text-sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {BACKBONE_SIZES[hp.backbone].map((s) => (
+                    <SelectItem key={s} value={s}>{s[0].toUpperCase() + s.slice(1)}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+            <label id={HEAD_FIELD_DEFS.pretrainedWeights.id} data-search-field="" className="flex items-center gap-1.5 cursor-pointer scroll-mt-4">
+              <input
+                type="checkbox"
+                checked={hp.pretrainedWeights}
+                onChange={(e) => {
+                  const pretrainedWeights = e.target.checked;
+                  onUpdate(pretrainedWeights ? { pretrainedWeights, colorMode: "rgb" as ColorMode } : { pretrainedWeights });
+                }}
+                className="accent-primary"
+              />
+              <span className="text-sm flex items-center gap-1">{HEAD_FIELD_DEFS.pretrainedWeights.label} <HintBubble text={HEAD_FIELD_DEFS.pretrainedWeights.hint ?? ""} /></span>
+            </label>
+            <p className="text-[10px] text-muted-foreground pl-1">
+              <Lightbulb className="mr-1 inline h-3 w-3 align-[-2px]" />
+              {hp.pretrainedWeights
+                ? `${hp.backbone === "convnext" ? "ConvNeXt" : "Swin Transformer"} ImageNet weights expect RGB — Convert Colors set to RGB. Max stride is fixed at 32.`
+                : `Training ${hp.backbone === "convnext" ? "ConvNeXt" : "Swin Transformer"} from scratch. Max stride is fixed at 32.`}
+            </p>
+          </>
+        )}
+        <Separator className="my-3" />
+        {!isPretrainedBackbone && (
+        <>
+        <div className="flex items-center gap-6 flex-wrap">
+          <div id={HEAD_FIELD_DEFS.stemStride.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+            <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {HEAD_FIELD_DEFS.stemStride.label}
+              <HintBubble text="If not None, controls how many stem blocks to use for initial downsampling. These are useful for learned downsampling that retains spatial information while reducing large input image sizes." />
+            </span>
+            <NumberInput min={1} integer nullable value={hp.stemStride} onCommit={(n) => onUpdate({ stemStride: n })} disabled={hp.stemStride === null} placeholder="0" className="h-8 text-sm w-16" />
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={hp.stemStride === null} onChange={(e) => onUpdate({ stemStride: e.target.checked ? null : 0 })} className="accent-primary" />
+              <span className="text-sm">None</span>
+            </label>
+          </div>
+        </div>
+        <div className="flex items-center gap-6 flex-wrap">
+          <div id={HEAD_FIELD_DEFS.maxStride.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+            <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {HEAD_FIELD_DEFS.maxStride.label}
+              <HintBubble text="Determines the number of downsampling blocks in the network, increasing receptive field size at the cost of network size. Auto picks a value from your labeled animals' sizes." />
+            </span>
+            <Select value={String(effectiveMaxStride)} onValueChange={(v) => onUpdate({ maxStride: Number(v) })} disabled={hp.maxStride === null}>
+              <SelectTrigger className="h-8 text-sm w-20"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {[2, 4, 8, 16, 32, 64, 128].map((v) => <SelectItem key={v} value={String(v)}>{v}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={hp.maxStride === null}
+                onChange={(e) => onUpdate({ maxStride: e.target.checked ? null : effectiveMaxStride })}
+                className="accent-primary"
+              />
+              <span className="text-sm">Auto</span>
+            </label>
+          </div>
+          <div id={HEAD_FIELD_DEFS.filters.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+            <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {HEAD_FIELD_DEFS.filters.label}
+              <HintBubble text="Base number of filters in the network." />
+            </span>
+            <NumberInput min={1} integer value={hp.filters} onCommit={(n) => onUpdate({ filters: n })} className="h-8 text-sm w-16" />
+          </div>
+        </div>
+        {hp.maxStride === null && sizeStats && (
+          <p className="text-[10px] text-muted-foreground pl-1">
+            <Lightbulb className="mr-1 inline h-3 w-3 align-[-2px]" />Auto: {effectiveMaxStride} — based on avg. animal size ~{Math.round(sizeStats.avgAnimalSize)}px (scaled {hp.scale}×)
+          </p>
+        )}
+        </>
+        )}
+        <div className="flex items-center gap-6 flex-wrap">
+          <div id={HEAD_FIELD_DEFS.filtersRate.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+            <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+              {HEAD_FIELD_DEFS.filtersRate.label}
+              <HintBubble text="Factor to scale the number of filters by at each block." />
+            </span>
+            <NumberInput min={1} value={hp.filtersRate} onCommit={(n) => onUpdate({ filtersRate: n })} step={0.1} className="h-8 text-sm w-20" />
+          </div>
+          {!isPretrainedBackbone && (
+          <label id={HEAD_FIELD_DEFS.middleBlock.id} data-search-field="" className="flex items-center gap-1.5 cursor-pointer scroll-mt-4">
+            <input type="checkbox" checked={hp.middleBlock} onChange={(e) => onUpdate({ middleBlock: e.target.checked })} className="accent-primary" />
+            <span className="text-sm flex items-center gap-1">{HEAD_FIELD_DEFS.middleBlock.label} <HintBubble text="If enabled, adds an intermediate block between the downsampling and upsampling branch for additional processing at the largest receptive field size." /></span>
+          </label>
+          )}
+          <label id={HEAD_FIELD_DEFS.upInterpolate.id} data-search-field="" className="flex items-center gap-1.5 cursor-pointer scroll-mt-4">
+            <input type="checkbox" checked={hp.upInterpolate} onChange={(e) => onUpdate({ upInterpolate: e.target.checked })} className="accent-primary" />
+            <span className="text-sm flex items-center gap-1">{HEAD_FIELD_DEFS.upInterpolate.label} <HintBubble text="If enabled, use bilinear upsampling instead of transposed convolutions. This can save computations but may lower overall accuracy." /></span>
+          </label>
+        </div>
+        <Separator className="my-3" />
+        <h4 className="text-sm font-medium text-muted-foreground mb-2">Head</h4>
+        {/* A box detector's heatmap spread is sized per box by sleap-nn. */}
+        {headType !== "bbox" && (
+          <Field {...HEAD_FIELD_DEFS.sigma}>
+            <NumberInput min={0.1} value={hp.sigma} onCommit={(n) => onUpdate({ sigma: n })} step={0.5} className="h-9 text-sm" />
+          </Field>
+        )}
+        <div id={HEAD_FIELD_DEFS.outputStride.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+          <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+            {HEAD_FIELD_DEFS.outputStride.label}
+            <HintBubble text="The stride of the output confidence maps relative to the input image. This is the reciprocal of the resolution (e.g., stride 2 = 0.5x size). Increasing this value speeds up performance and decreases memory, at the cost of spatial resolution." />
+          </span>
+          <Select value={String(hp.outputStride)} onValueChange={(v) => onUpdate({ outputStride: Number(v) })}>
+            <SelectTrigger className="h-8 text-sm w-20"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {[1, 2, 4, 8, 16, 32, 64].map((v) => <SelectItem key={v} value={String(v)}>{v}</SelectItem>)}
+            </SelectContent>
+          </Select>
+        </div>
+        {headType === "bottomup" && (
+          <>
+            <Field {...HEAD_FIELD_DEFS.confmapsLossWeight} hint="Loss weight for the confidence maps head. Increase to prioritize this head during multi-head training.">
+              <LogNumberInput value={hp.confmapsLossWeight} onChange={(v) => onUpdate({ confmapsLossWeight: v })} className="h-9 text-sm" />
+            </Field>
+            <Field {...HEAD_FIELD_DEFS.pafsLossWeight} hint="Loss weight for the part affinity fields head. Increase to prioritize this head during multi-head training.">
+              <LogNumberInput value={hp.pafsLossWeight} onChange={(v) => onUpdate({ pafsLossWeight: v })} className="h-9 text-sm" />
+            </Field>
+          </>
+        )}
+        {headType === "multi_class_topdown" && (
+          <>
+            <Field {...HEAD_FIELD_DEFS.confmapsLossWeight} hint="Loss weight for the confidence maps head. Increase to prioritize this head during multi-head training.">
+              <LogNumberInput value={hp.confmapsLossWeight} onChange={(v) => onUpdate({ confmapsLossWeight: v })} className="h-9 text-sm" />
+            </Field>
+            <Field {...HEAD_FIELD_DEFS.classVectorsLossWeight} hint="Loss weight for the classification head. Increase to prioritize this head during multi-head training.">
+              <LogNumberInput value={hp.classLossWeight} onChange={(v) => onUpdate({ classLossWeight: v })} className="h-9 text-sm" />
+            </Field>
+          </>
+        )}
+        {headType === "multi_class_bottomup" && (
+          <>
+            <Field {...HEAD_FIELD_DEFS.confmapsLossWeight} hint="Loss weight for the confidence maps head. Increase to prioritize this head during multi-head training.">
+              <LogNumberInput value={hp.confmapsLossWeight} onChange={(v) => onUpdate({ confmapsLossWeight: v })} className="h-9 text-sm" />
+            </Field>
+            <Field {...HEAD_FIELD_DEFS.classMapsLossWeight} hint="Loss weight for the classification maps head. Increase to prioritize this head during multi-head training.">
+              <LogNumberInput value={hp.classLossWeight} onChange={(v) => onUpdate({ classLossWeight: v })} className="h-9 text-sm" />
+            </Field>
+          </>
+        )}
+      </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main dialog ────────────────────────────────────────────────────
+
+export function TrainingConfigDialog({
+  open,
+  onClose,
+  modelType,
+  configs,
+  onUpdateSlot,
+  inferenceTarget,
+  onInferenceTargetChange,
+  remoteEnabled,
+  onRemoteEnabledChange,
+  skeletonNodes = [],
+  sampleCount,
+  onSampleCountChange,
+  skipUserLabeled,
+  onSkipUserLabeledChange,
+  existingPredictions,
+  onExistingPredictionsChange,
+  autoOpenWandb,
+  onAutoOpenWandbChange,
+  exportFormat,
+  onExportFormatChange,
+  useExportedForInference,
+  onUseExportedForInferenceChange,
+  labelsOverride,
+  remoteFrame,
+  configActions,
+  mode = "project",
+}: TrainingConfigDialogProps) {
+  const pipelineScrollRef = useRef<HTMLDivElement>(null);
+  const headScrollRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const [activeTab, setActiveTab] = useState("pipeline");
+  const [searchQuery, setSearchQuery] = useState("");
+  // TensorRT export is NVIDIA/CUDA-only — detect the GPU to gate the dropdown option.
+  const [gpuBackend, setGpuBackend] = useState<string | null>(null);
+  useEffect(() => {
+    if (isTauri) detectGpu().then(setGpuBackend).catch(() => setGpuBackend(null));
+  }, []);
+  const trtAvailable = gpuBackend === "cuda";
+
+  // Detect existing W&B auth (env var / ~/.netrc) on the local machine so the
+  // API-key field can advertise itself as optional. Desktop-only; a no-op in
+  // the browser (checkWandbAuth returns not-authenticated there).
+  const [wandbAuth, setWandbAuth] = useState<WandbAuth | null>(null);
+  const refreshWandbAuth = useCallback(() => {
+    checkWandbAuth().then(setWandbAuth).catch(() => {});
+  }, []);
+  // Re-detect every time the dialog opens (the component stays mounted, so a
+  // one-shot mount effect would go stale after a `wandb login`).
+  useEffect(() => {
+    if (!open) return;
+    refreshWandbAuth();
+  }, [open, refreshWandbAuth]);
+
+  // App store for suggestions count — overridden by `labelsOverride` (and its
+  // one skeleton) in worker-file mode, so every stat below reflects the
+  // worker-side SLP instead of whatever project happens to be open.
+  const storeLabels = useAppStore((s) => s.labels);
+  const labels = labelsOverride ?? storeLabels;
+  const suggestionsCount = labels?.suggestions?.length ?? 0;
+  const clipRange = useAppStore((s) => s.frameRange);
+  const clipDescription = describeClip(clipRange);
+  const storeSkeleton = useAppStore((s) => s.skeleton);
+  const skeleton = labelsOverride ? (labelsOverride.skeletons[0] ?? null) : storeSkeleton;
+  const overlayVersion = useAppStore((s) => s.overlayVersion);
+  const nodeVisibility = useMemo(
+    () => computeNodeVisibility(labels, skeleton),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [labels, skeleton, overlayVersion]
+  );
+
+  // Auto-load baseline configs for empty slots when dialog opens
+  const {
+    parseYamlConfig,
+    addConfigFile: storeAddConfigFile,
+    resetConfigHyperparams: storeResetConfigHyperparams,
+  } = useTrainingStore();
+  const addConfigFile = configActions?.addConfigFile ?? storeAddConfigFile;
+  const resetConfigHyperparams = configActions?.resetConfigHyperparams ?? storeResetConfigHyperparams;
+  useEffect(() => {
+    if (!open) return;
+    const slots = getConfigSlots(modelType);
+    const sizeStats = computeInstanceSizeStats(labels);
+    const backboneRecommendation = sizeStats
+      ? recommendBackboneProfile(sizeStats.maxBboxDim, sizeStats.maxFrameDim)
+      : null;
+    for (const slot of slots) {
+      const existing = configs.find((c) => c.slot === slot);
+      if (existing) continue;
+      const headType = slotToHeadType(modelType, slot);
+      const baseline = getRecommendedProfileForHead(headType, backboneRecommendation);
+      if (baseline) {
+        const parsed = parseYamlConfig(baseline.content, baseline.filename, slot);
+        // Fresh configs keep the preset's fixed max_stride, as in SLEAP (Auto
+        // is opt-in; see recommendMaxStride in modelStats.ts).
+        if (parsed) addConfigFile(parsed);
+      }
+    }
+  }, [open, modelType]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Sort configs to match canonical slot order (centroid first for top-down)
+  const slotOrder = getConfigSlots(modelType);
+  const sortedConfigs = [...configs].sort((a, b) => {
+    const ai = slotOrder.indexOf(a.slot);
+    const bi = slotOrder.indexOf(b.slot);
+    return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+  });
+
+  // PyQt's footer buttons: Copy to clipboard / Save configuration files... / Export Training Job Package...
+  const [configBusy, setConfigBusy] = useState(false);
+  const runConfigAction = async (action: (req: TrainingConfigRequest) => Promise<unknown>) => {
+    setConfigBusy(true);
+    try {
+      await action({ modelType, configs: sortedConfigs, inferenceTarget, sampleCount, skipUserLabeled });
+    } finally {
+      setConfigBusy(false);
+    }
+  };
+
+  const scrollTo = useCallback((id: string) => {
+    const activeRef = activeTab === "pipeline"
+      ? pipelineScrollRef.current
+      : headScrollRefs.current[activeTab];
+    const el = activeRef?.querySelector(`#${id}`);
+    el?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [activeTab]);
+
+  const searchResults = searchQuery.trim()
+    ? SEARCHABLE_FIELDS.filter((f) => fieldMatchesQuery(f, searchQuery))
+    : [];
+
+  const handleSearchSelect = (field: IndexedField) => {
+    setSearchQuery("");
+    // Per-head fields render identically in every head tab. Keep the user on
+    // the head tab they're already viewing; otherwise jump to the first head
+    // tab (never leave a head result stranded on the pipeline tab).
+    const headSlots = sortedConfigs.map((c) => c.slot);
+    const targetTab = field.tab === "pipeline"
+      ? "pipeline"
+      : headSlots.includes(activeTab)
+        ? activeTab
+        : headSlots[0] ?? "pipeline";
+    setActiveTab(targetTab);
+    setTimeout(() => {
+      const ref = targetTab === "pipeline" ? pipelineScrollRef.current : headScrollRefs.current[targetTab];
+      const el = ref?.querySelector(`#${CSS.escape(field.id)}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.add("ring-2", "ring-primary", "rounded");
+        setTimeout(() => el.classList.remove("ring-2", "ring-primary", "rounded"), 1500);
+      }
+    }, 100);
+  };
+
+  // Reset to the values loaded from the baseline profile (each config's
+  // `originalHyperparams`). Scoped to the active tab: the Pipeline tab edits
+  // shared fields across every slot, so it resets them all; a head tab resets
+  // only its own slot.
+  const handleResetDefaults = async () => {
+    const isPipeline = activeTab === "pipeline";
+    const scope = isPipeline
+      ? "all model configs"
+      : `the ${getSlotLabel(activeTab).replace(" Config", "")} config`;
+    const ok = await confirmDialog({
+      title: "Reset to profile defaults?",
+      message: `This restores ${scope} to the values loaded from the baseline profile, discarding your edits.`,
+      confirmLabel: "Reset",
+      destructive: true,
+    });
+    if (!ok) return;
+    if (isPipeline) sortedConfigs.forEach((c) => resetConfigHyperparams(c.slot));
+    else resetConfigHyperparams(activeTab);
+  };
+
+  const navItems =
+    activeTab === "pipeline"
+      ? mode === "worker-file"
+        ? PIPELINE_NAV.filter((item) => item.id !== "pipeline-remote")
+        : PIPELINE_NAV
+      : HEAD_NAV;
+  const firstConfig = sortedConfigs[0];
+  const firstHp = firstConfig?.hyperparams;
+
+  return (
+    <Dialog open={open} onOpenChange={(isOpen) => { if (!isOpen) { onClose(); setSearchQuery(""); } }}>
+      <DialogContent showCloseButton={false} className="w-[92vw] h-[90vh] min-w-[640px] min-h-[480px] max-w-[96vw] sm:max-w-[96vw] max-h-[94vh] resize overflow-hidden p-0 inset-0 translate-x-0 translate-y-0 m-auto flex flex-col" onKeyDown={(e) => e.stopPropagation()} onInteractOutside={keepOpenOnToastClick}>
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="flex flex-col flex-1 min-h-0 gap-0">
+          {/* Compact header: title (left) · flat centered tabs · saved indicator (right) */}
+          <div className="relative flex items-center justify-between gap-4 px-6 py-2.5 border-b shrink-0">
+            <DialogTitle className="text-base font-semibold shrink-0">Training Configuration</DialogTitle>
+            <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
+              <TabsList>
+                <TabsTrigger value="pipeline" className="text-sm px-4 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground dark:data-[state=active]:bg-primary dark:data-[state=active]:text-primary-foreground">Pipeline</TabsTrigger>
+                {sortedConfigs.map((cf) => (
+                  <TabsTrigger key={cf.slot} value={cf.slot} className="text-sm px-4 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground dark:data-[state=active]:bg-primary dark:data-[state=active]:text-primary-foreground">
+                    {getSlotLabel(cf.slot).replace(" Config", "")}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </div>
+            <span
+              className="flex items-center gap-1.5 text-xs text-muted-foreground shrink-0"
+              title="Edits are saved automatically as you type"
+            >
+              <Check className="h-3.5 w-3.5 text-emerald-500" />
+              All changes saved
+            </span>
+          </div>
+
+          {/* Field search — full-width row snug below the header */}
+          <div className="relative px-6 py-2 border-b shrink-0">
+            <Search className="absolute left-8 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+            <Input
+              type="text"
+              placeholder="Search parameters..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="h-9 text-sm pl-9"
+            />
+            {searchResults.length > 0 && (
+              <div className="absolute top-full left-6 right-6 mt-1 bg-popover border rounded-md shadow-lg z-10 max-h-48 overflow-y-auto">
+                {searchResults.map((r) => (
+                  <button
+                    key={`${r.tab}:${r.id}`}
+                    className="w-full text-left px-3 py-2 text-sm hover:bg-accent/50 flex items-center justify-between"
+                    onClick={() => handleSearchSelect(r)}
+                  >
+                    <span>{r.label}</span>
+                    <span className="text-xs text-muted-foreground">{r.tab === "pipeline" ? "Training Pipeline" : "Per-Head"}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-1 min-h-0">
+            <nav className="w-[180px] border-r bg-muted/30 py-3 shrink-0">
+              {navItems.map((item) => (
+                <button
+                  key={item.id}
+                  className="w-full text-left px-5 py-2.5 text-sm transition-colors text-muted-foreground hover:text-foreground hover:bg-accent/50"
+                  onClick={() => scrollTo(item.id)}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </nav>
+
+            {/* ── Training Pipeline tab ── */}
+            <TabsContent value="pipeline" className="flex-1 min-h-0 mt-0 overflow-hidden">
+              <div ref={pipelineScrollRef} className="h-full overflow-y-auto px-8 py-6 bg-muted/20">
+
+                {/* 1. Pipeline Type */}
+                <SectionHeading {...PIPELINE_FIELD_DEFS.secType} />
+                <div className="space-y-3">
+                  <Field label="Type">
+                    <span className="text-sm font-medium">{MODEL_TYPE_LABELS[modelType]}</span>
+                  </Field>
+                  <p className="text-sm text-muted-foreground leading-relaxed">
+                    {MODEL_TYPE_DESCRIPTIONS[modelType]}
+                  </p>
+                  {(modelType === "top_down" || modelType === "top_down_id") && (
+                    <div className="flex items-center gap-4 flex-wrap pt-1">
+                      {(() => {
+                        const ciConfig = configs.find((c) => c.slot === "centered_instance");
+                        return ciConfig ? (
+                          <PipelineAnchorPartField
+                            hp={ciConfig.hyperparams}
+                            onUpdate={(updates) => onUpdateSlot("centered_instance", updates)}
+                            skeletonNodes={skeletonNodes}
+                            nodeVisibility={nodeVisibility}
+                          />
+                        ) : null;
+                      })()}
+                      <div id={PIPELINE_FIELD_DEFS.sigmaCentroids.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.sigmaCentroids.label}
+                          <HintBubble text="Gaussian spread for centroid confidence maps. Controls how wide the target peak is around each animal's center point." />
+                        </span>
+                        <NumberInput min={0.1}
+                          value={configs.find((c) => c.slot === "centroid")?.hyperparams.sigma ?? 5.0}
+                          onCommit={(n) => { const slot = configs.find((c) => c.slot === "centroid")?.slot; if (slot) onUpdateSlot(slot, { sigma: n }); }}
+ step={0.5}
+                          className="h-8 text-sm w-20"
+                        />
+                      </div>
+                      <div id={PIPELINE_FIELD_DEFS.sigmaNodes.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.sigmaNodes.label}
+                          <HintBubble text="Gaussian spread for node confidence maps. Controls how wide the target peak is around each keypoint location." />
+                        </span>
+                        <NumberInput min={0.1}
+                          value={configs.find((c) => c.slot === "centered_instance")?.hyperparams.sigma ?? 5.0}
+                          onCommit={(n) => { const slot = configs.find((c) => c.slot === "centered_instance")?.slot; if (slot) onUpdateSlot(slot, { sigma: n }); }}
+ step={0.5}
+                          className="h-8 text-sm w-20"
+                        />
+                      </div>
+                    </div>
+                  )}
+                  {(modelType === "bbox" || modelType === "top_down_bbox") && (
+                    <div className="max-w-md pt-1">
+                      <BboxTrainingFields
+                        modelType={modelType}
+                        configs={configs}
+                        onUpdateSlot={onUpdateSlot}
+                        size="md"
+                      />
+                    </div>
+                  )}
+                  {modelType === "single_animal" && firstHp && (
+                    <div className="flex items-center gap-4 pt-1">
+                      <div id={PIPELINE_FIELD_DEFS.sigmaNodes.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          Sigma
+                          <HintBubble text="Gaussian spread for keypoint heatmaps. Smaller = more precise but harder to train. Larger = easier to train but less spatially precise." />
+                        </span>
+                        <NumberInput min={0.1}
+                          value={firstHp.sigma}
+                          onCommit={(n) => onUpdateSlot(firstConfig!.slot, { sigma: n })}
+ step={0.5}
+                          className="h-8 text-sm w-20"
+                        />
+                      </div>
+                    </div>
+                  )}
+                  {(modelType === "bottom_up" || modelType === "bottom_up_id") && firstHp && (
+                    <div className="flex items-center gap-4 pt-1">
+                      <div id={PIPELINE_FIELD_DEFS.sigmaNodes.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          Sigma
+                          <HintBubble text="Gaussian spread for confidence maps. Controls how wide the target peak is around each keypoint." />
+                        </span>
+                        <NumberInput min={0.1}
+                          value={firstHp.sigma}
+                          onCommit={(n) => onUpdateSlot(firstConfig!.slot, { sigma: n })}
+ step={0.5}
+                          className="h-8 text-sm w-20"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/*
+                  Post-training inference target/sample-count/existing-
+                  predictions controls are "project" mode only: a worker-file
+                  launch (PR5b's NewJobWizard) owns its own toggle + a
+                  restricted target list with no current-video/current-frame
+                  options (there's no open project to have a "current"
+                  anything), and wires its OWN state into THIS dialog's post-
+                  train inference fields would be meaningless here — showing
+                  controls that silently don't affect the submitted spec is
+                  more confusing than hiding them, same rationale as the
+                  Remote Training section below.
+                */}
+                {mode !== "worker-file" && (
+                  <>
+                    <Separator className="my-5" />
+
+                    {/* 2. Inference Target */}
+                    <SectionHeading {...PIPELINE_FIELD_DEFS.secInference} />
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-4 flex-wrap">
+                        <div id={PIPELINE_FIELD_DEFS.inferenceTarget.id} data-search-field="" className="flex items-center gap-2 flex-1 min-w-0 scroll-mt-4">
+                          <span className="text-sm text-muted-foreground shrink-0 flex items-center gap-1.5">
+                            {PIPELINE_FIELD_DEFS.inferenceTarget.label}
+                            <HintBubble text="Which frames to run inference on after training completes. Predictions will be merged back into the project." />
+                          </span>
+                          <Select value={inferenceTarget} onValueChange={onInferenceTargetChange}>
+                            <SelectTrigger className="h-9 text-sm w-48"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              {POST_TRAINING_TARGET_OPTIONS.map((o) => (
+                                <SelectItem key={o.value} value={o.value} disabled={o.value === "clip" && !clipDescription}>
+                                  {o.label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        {inferenceTarget === "suggestions" && (
+                          <span className="text-sm text-muted-foreground">
+                            Frames in the Labeling Suggestions list ({suggestionsCount} frames)
+                          </span>
+                        )}
+                        {inferenceTarget === "frame" && (
+                          <span className="text-sm text-muted-foreground">
+                            The frame shown when training finishes
+                          </span>
+                        )}
+                        {inferenceTarget === "clip" && (
+                          <span className={`text-sm ${clipDescription ? "text-muted-foreground" : "text-destructive"}`}>
+                            {clipDescription
+                              ? `Selected on the timeline: ${clipDescription}`
+                              : "No clip selected — drag on the timeline to select one, or inference will be skipped"}
+                          </span>
+                        )}
+                        {(inferenceTarget === "random_video" || inferenceTarget === "random") && (
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm text-muted-foreground">Sample count:</span>
+                            <NumberInput min={1} integer value={sampleCount}
+                              onCommit={(n) => onSampleCountChange(n)}
+                              className="h-8 text-sm w-24" />
+                          </div>
+                        )}
+                      </div>
+                      <Toggle
+                        {...PIPELINE_FIELD_DEFS.skipUserLabeled}
+                        checked={skipUserLabeled}
+                        onChange={onSkipUserLabeledChange}
+                      />
+                      <div id={PIPELINE_FIELD_DEFS.existingPredictions.id} data-search-field="" className="flex items-center gap-4 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          Existing predictions:
+                          <HintBubble text="What to do with predicted instances already in the project when this run's post-training inference produces new ones. Clear all removes every existing predicted instance first. Replace overwrites predictions on frames the new inference re-runs. Keep leaves existing predictions untouched and only adds new ones." />
+                        </span>
+                        {(["clear_all", "replace", "keep"] as const).map((option) => (
+                          <label key={option} className="flex items-center gap-1.5 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="existing-predictions"
+                              checked={existingPredictions === option}
+                              onChange={() => onExistingPredictionsChange(option)}
+                              className="accent-primary"
+                            />
+                            <span className="text-sm">{option === "clear_all" ? "Clear all" : option === "replace" ? "Replace" : "Keep"}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                <Separator className="my-5" />
+
+                {/* 3. Pre-processing / Post-processing */}
+                <SectionHeading {...PIPELINE_FIELD_DEFS.secPreproc} />
+                {firstHp ? (
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-6 flex-wrap">
+                      <div id={PIPELINE_FIELD_DEFS.convertColors.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.convertColors.label}
+                          <HintBubble text="Convert input images to a specific channel format. Use RGB for pretrained backbones or Grayscale for single-channel videos." />
+                        </span>
+                        <Select
+                          value={firstHp.colorMode}
+                          onValueChange={(v) => configs.forEach((c) => onUpdateSlot(c.slot, { colorMode: v as ColorMode }))}
+                        >
+                          <SelectTrigger className="h-8 text-sm w-32"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="auto">Auto</SelectItem>
+                            <SelectItem value="rgb">RGB</SelectItem>
+                            <SelectItem value="grayscale">Grayscale</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      {/* Max Instances and Filter Overlapping Instances are inference-time
+                          post-processing concepts (max detections per frame, NMS/IOU/OKS
+                          overlap filtering) with no sleap-nn training key — disabled here so
+                          the training dialog doesn't imply they affect training. */}
+                      <div id={PIPELINE_FIELD_DEFS.maxInstances.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4 opacity-50">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.maxInstances.label}
+                          <HintBubble text="Maximum number of animal instances to detect per frame. Leave empty or check 'No max' for no limit." />
+                        </span>
+                        <Input type="number" placeholder="1" disabled className="h-8 text-sm w-16" />
+                      </div>
+                      <label className="flex items-center gap-1.5 opacity-50">
+                        <input type="checkbox" defaultChecked disabled className="accent-primary" />
+                        <span className="text-sm">No max</span>
+                      </label>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <label id={PIPELINE_FIELD_DEFS.filterOverlapping.id} data-search-field="" className="flex items-center gap-1.5 scroll-mt-4 opacity-50">
+                        <input type="checkbox" disabled className="accent-primary" />
+                        <span className="text-sm flex items-center gap-1">
+                          {PIPELINE_FIELD_DEFS.filterOverlapping.label}
+                          <HintBubble text="Removes duplicate detections of the same animal by bounding-box IOU or pose OKS overlap. This is an inference-time post-processing step, not a training parameter — it's disabled here and configured when running inference instead." />
+                        </span>
+                      </label>
+                      <div className="flex items-center gap-2 opacity-50">
+                        <span className="text-sm text-muted-foreground">Method:</span>
+                        <Select value="iou" disabled>
+                          <SelectTrigger className="h-8 text-sm w-36"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="iou">IOU (bounding box)</SelectItem>
+                            <SelectItem value="oks">OKS</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="flex items-center gap-2 opacity-50">
+                        <span className="text-sm text-muted-foreground">Threshold:</span>
+                        <Input type="number" value={0.80} disabled step={0.05} className="h-8 text-sm w-16" />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">Upload config files to configure preprocessing.</p>
+                )}
+
+                <Separator className="my-5" />
+
+                {/* 4. Performance */}
+                <SectionHeading {...PIPELINE_FIELD_DEFS.secPerformance} />
+                <div className="space-y-3">
+                  <div className="flex items-center gap-6 flex-wrap">
+                    <div id={PIPELINE_FIELD_DEFS.dataPipeline.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.dataPipeline.label}
+                        <HintBubble text="How training data is loaded. 'Cache in Memory' is fastest but uses more RAM. 'Stream' reads from disk each epoch. 'Cache to Disk' saves processed data to disk." />
+                      </span>
+                      <Select value={firstHp?.dataPipeline ?? "memory"} onValueChange={(v) => configs.forEach((c) => onUpdateSlot(c.slot, { dataPipeline: v as DataPipeline }))}>
+                        <SelectTrigger className="h-8 text-sm w-40"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="stream">Stream (no caching)</SelectItem>
+                          <SelectItem value="memory">Cache in Memory</SelectItem>
+                          <SelectItem value="disk">Cache to Disk</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div id={PIPELINE_FIELD_DEFS.dataloaderWorkers.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.dataloaderWorkers.label}
+                        <HintBubble text="Number of parallel workers for loading training data. More workers = faster data loading but more CPU/memory usage. 0 = main thread only. Only takes effect with a caching pipeline (Cache in Memory / Cache to Disk); the Stream pipeline forces 0." />
+                      </span>
+                      <NumberInput min={0} max={16} integer value={firstHp?.dataloaderWorkers ?? 0} onCommit={(n) => configs.forEach((c) => onUpdateSlot(c.slot, { dataloaderWorkers: n }))} className="h-8 text-sm w-16" />
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-6 flex-wrap">
+                    <div id={PIPELINE_FIELD_DEFS.accelerator.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.accelerator.label}
+                        <HintBubble text="Hardware to use for training. 'Auto' detects available hardware. Use 'cuda' for NVIDIA GPUs, 'mps' for Apple Silicon, or 'cpu' for CPU-only (slow)." />
+                      </span>
+                      <Select value={firstHp?.accelerator ?? "auto"} onValueChange={(v) => configs.forEach((c) => onUpdateSlot(c.slot, { accelerator: v as "auto" | "cuda" | "mps" | "cpu" }))}>
+                        <SelectTrigger className="h-8 text-sm w-28"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="auto">auto</SelectItem>
+                          <SelectItem value="cuda">cuda</SelectItem>
+                          <SelectItem value="mps">mps</SelectItem>
+                          <SelectItem value="cpu">cpu</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div id={PIPELINE_FIELD_DEFS.numDevices.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.numDevices.label}
+                        <HintBubble text="Number of GPUs/devices to use for training. Set to 1 for single-GPU training." />
+                      </span>
+                      <NumberInput min={1} max={8} integer value={firstHp?.numDevices === "auto" ? 1 : (firstHp?.numDevices ?? 1)} disabled={(firstHp?.numDevices ?? "auto") === "auto"} onCommit={(n) => configs.forEach((c) => onUpdateSlot(c.slot, { numDevices: n }))} className="h-8 text-sm w-16" />
+                    </div>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input type="checkbox" checked={(firstHp?.numDevices ?? "auto") === "auto"} onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { numDevices: e.target.checked ? "auto" : 1 }))} className="accent-primary" />
+                      <span className="text-sm">Auto</span>
+                    </label>
+                    <div id={PIPELINE_FIELD_DEFS.trainerStrategy.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.trainerStrategy.label}
+                        <HintBubble text={PIPELINE_FIELD_DEFS.trainerStrategy.hint} />
+                      </span>
+                      <Select value={firstHp?.trainerStrategy ?? "auto"} onValueChange={(v) => configs.forEach((c) => onUpdateSlot(c.slot, { trainerStrategy: v as "auto" | "ddp" | "fsdp" }))} disabled={firstHp?.numDevices === "auto" || (typeof firstHp?.numDevices === "number" && firstHp.numDevices <= 1)}>
+                        <SelectTrigger className="h-8 text-sm w-28"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="auto">auto</SelectItem>
+                          <SelectItem value="ddp">ddp</SelectItem>
+                          <SelectItem value="fsdp">fsdp</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                </div>
+
+                <Separator className="my-5" />
+
+                {/* 5. W&B */}
+                <SectionHeading {...PIPELINE_FIELD_DEFS.secWandb} />
+                {firstHp ? (
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm text-muted-foreground">Status:</span>
+                      {wandbAuth?.authenticated ? (
+                        <>
+                          <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                          <span className="text-sm text-green-400">
+                            Authenticated{wandbAuth.source ? ` (${wandbAuth.source})` : ""}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
+                          <span className="text-sm text-red-400">Not logged in</span>
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        onClick={refreshWandbAuth}
+                        title="Re-check W&B login"
+                        className="text-muted-foreground hover:text-foreground"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-4 flex-wrap">
+                      <Toggle {...PIPELINE_FIELD_DEFS.wandbEnable} checked={firstHp.useWandb} onChange={(v) => configs.forEach((c) => onUpdateSlot(c.slot, { useWandb: v }))} />
+                      <Toggle {...PIPELINE_FIELD_DEFS.wandbOffline} checked={firstHp.wandbMode === "offline"} onChange={(v) => configs.forEach((c) => onUpdateSlot(c.slot, { wandbMode: v ? "offline" : "online" }))} disabled={!firstHp.useWandb} />
+                      <Toggle {...PIPELINE_FIELD_DEFS.wandbUploadViz} checked={firstHp.wandbUploadViz} onChange={(v) => configs.forEach((c) => onUpdateSlot(c.slot, { wandbUploadViz: v }))} disabled={!firstHp.useWandb || firstHp.wandbMode === "offline"} />
+                      <Toggle {...PIPELINE_FIELD_DEFS.wandbOpenBrowser} checked={autoOpenWandb} onChange={onAutoOpenWandbChange} disabled={!firstHp.useWandb || firstHp.wandbMode === "offline"} />
+                    </div>
+                    <div className="flex items-center gap-6 flex-wrap">
+                      <div id={PIPELINE_FIELD_DEFS.wandbApiKey.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.wandbApiKey.label}:
+                          <HintBubble text="W&B API key from wandb.ai/authorize. Optional — leave blank if you've run 'wandb login' or set the WANDB_API_KEY environment variable." />
+                        </span>
+                        <Input type="password" autoComplete="off" value={firstHp.wandbApiKey} onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { wandbApiKey: e.target.value }))} placeholder={wandbAuth?.authenticated ? "Detected — leave blank to use it" : ""} className="h-8 text-sm w-56" disabled={!firstHp.useWandb || firstHp.wandbMode === "offline"} />
+                      </div>
+                      {firstHp.wandbMode === "offline" && (
+                        <span className="text-xs text-muted-foreground">Logged locally — run <span className="font-mono">wandb sync</span> to upload later.</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-6 flex-wrap">
+                      <div id={PIPELINE_FIELD_DEFS.wandbEntity.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.wandbEntity.label}:
+                          <HintBubble text="Your W&B username or team name that owns the project this run logs to. Leave blank to use your default W&B entity." />
+                        </span>
+                        <Input type="text" value={firstHp.wandbEntity} onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { wandbEntity: e.target.value }))} placeholder="" className="h-8 text-sm w-40" disabled={!firstHp.useWandb} />
+                      </div>
+                      <div id={PIPELINE_FIELD_DEFS.wandbProject.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.wandbProject.label}:
+                          <HintBubble text="The W&B project this run's metrics and visualizations are logged under. Created automatically if it doesn't already exist." />
+                        </span>
+                        <Input type="text" value={firstHp.wandbProject} onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { wandbProject: e.target.value }))} placeholder="" className="h-8 text-sm w-40" disabled={!firstHp.useWandb} />
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-6 flex-wrap">
+                      <div id={PIPELINE_FIELD_DEFS.wandbRunId.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.wandbRunId.label}:
+                          <HintBubble text="ID of a previous W&B run to resume logging into instead of starting a new one. Pair this with Resume Training so training metrics continue on the same run's timeline." />
+                        </span>
+                        <Input type="text" value={firstHp.wandbPrevRunId} onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { wandbPrevRunId: e.target.value }))} placeholder="" className="h-8 text-sm w-40" disabled={!firstHp.useWandb} />
+                      </div>
+                      <div id={PIPELINE_FIELD_DEFS.wandbGroup.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.wandbGroup.label}:
+                          <HintBubble text="Optional label to cluster related runs together in the W&B UI, e.g. runs from the same experiment or hyperparameter sweep." />
+                        </span>
+                        <Input type="text" value={firstHp.wandbGroup} onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { wandbGroup: e.target.value }))} placeholder="" className="h-8 text-sm w-40" disabled={!firstHp.useWandb} />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">Upload config files to configure W&B.</p>
+                )}
+
+                <Separator className="my-5" />
+
+                {/* 6. Evaluation */}
+                <SectionHeading {...PIPELINE_FIELD_DEFS.secEvaluation} />
+                <div className="space-y-3">
+                  <div className="flex items-center gap-6">
+                    <Toggle
+                      {...PIPELINE_FIELD_DEFS.evalEnable}
+                      checked={firstHp?.evalEnabled ?? false}
+                      onChange={(v) => configs.forEach((c) => onUpdateSlot(c.slot, { evalEnabled: v }))}
+                    />
+                    <div id={PIPELINE_FIELD_DEFS.evalFrequency.id} data-search-field="" className={`flex items-center gap-2 scroll-mt-4 ${!firstHp?.evalEnabled ? "opacity-50" : ""}`}>
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.evalFrequency.label}:
+                        <HintBubble text="How often to run full evaluation. Every 1 epoch is most informative but slower. Every 5–10 epochs is a good balance." />
+                      </span>
+                      <NumberInput min={1} integer
+                        value={firstHp?.evalFrequency ?? 1}
+
+                        disabled={!firstHp?.evalEnabled}
+                        onCommit={(n) => configs.forEach((c) => onUpdateSlot(c.slot, { evalFrequency: n }))}
+                        className="h-8 text-sm w-16"
+                      />
+                    </div>
+                  </div>
+                  <div className={`flex items-center gap-4 flex-wrap ${!firstHp?.evalEnabled ? "opacity-50" : ""}`}>
+                    <div id={PIPELINE_FIELD_DEFS.evalOksStddev.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.evalOksStddev.label}
+                        <HintBubble text={PIPELINE_FIELD_DEFS.evalOksStddev.hint} />
+                      </span>
+                      <NumberInput min={0}
+                        value={firstHp?.evalOksStddev ?? 0.025}
+                        step={0.001}
+
+                        disabled={!firstHp?.evalEnabled}
+                        onCommit={(n) => configs.forEach((c) => onUpdateSlot(c.slot, { evalOksStddev: n }))}
+                        className="h-8 text-sm w-20"
+                      />
+                    </div>
+                    <div id={PIPELINE_FIELD_DEFS.evalOksScale.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.evalOksScale.label}
+                        <HintBubble text={PIPELINE_FIELD_DEFS.evalOksScale.hint} />
+                      </span>
+                      <NumberInput min={0} nullable
+                        value={firstHp?.evalOksScale}
+                        step={0.01}
+
+                        placeholder="Auto"
+                        disabled={!firstHp?.evalEnabled}
+                        onCommit={(n) => configs.forEach((c) => onUpdateSlot(c.slot, { evalOksScale: n }))}
+                        className="h-8 text-sm w-20"
+                      />
+                    </div>
+                    <div id={PIPELINE_FIELD_DEFS.evalMatchThreshold.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.evalMatchThreshold.label}
+                        <HintBubble text={PIPELINE_FIELD_DEFS.evalMatchThreshold.hint} />
+                      </span>
+                      <NumberInput min={0}
+                        value={firstHp?.evalMatchThreshold ?? 50.0}
+                        step={0.5}
+
+                        disabled={!firstHp?.evalEnabled}
+                        onCommit={(n) => configs.forEach((c) => onUpdateSlot(c.slot, { evalMatchThreshold: n }))}
+                        className="h-8 text-sm w-20"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <Separator className="my-5" />
+
+                {/* 7. Output */}
+                <SectionHeading {...PIPELINE_FIELD_DEFS.secOutput} />
+                {firstHp ? (
+                  <div className="space-y-3">
+                    <Field {...PIPELINE_FIELD_DEFS.runName}>
+                      <Input type="text" value={firstHp.runName} onChange={(e) => onUpdateSlot(firstConfig!.slot, { runName: e.target.value })} placeholder="Auto-generated" className="h-9 text-sm" />
+                    </Field>
+                    <Field {...PIPELINE_FIELD_DEFS.runsFolder}>
+                      <Input type="text" value="models" disabled className="h-9 text-sm" />
+                    </Field>
+                    <div id={PIPELINE_FIELD_DEFS.checkpoint.id} data-search-field="" className="flex items-center gap-6 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.checkpoint.label}:
+                        <HintBubble text={PIPELINE_FIELD_DEFS.checkpoint.hint} />
+                      </span>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={firstHp.saveBestModel}
+                          onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { saveBestModel: e.target.checked }))}
+                          className="accent-primary"
+                        />
+                        <span className="text-sm">Best Model</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={firstHp.saveLastModel}
+                          onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { saveLastModel: e.target.checked }))}
+                          className="accent-primary"
+                        />
+                        <span className="text-sm">Latest Model</span>
+                      </label>
+                      <div id={PIPELINE_FIELD_DEFS.checkpointTopK.id} data-search-field="" className={`flex items-center gap-2 scroll-mt-4 ${!firstHp.saveBestModel ? "opacity-50" : ""}`}>
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.checkpointTopK.label}
+                          <HintBubble text={PIPELINE_FIELD_DEFS.checkpointTopK.hint} />
+                        </span>
+                        <NumberInput min={-1} integer
+                          value={firstHp.saveTopKCount}
+
+                          disabled={!firstHp.saveBestModel}
+                          onCommit={(n) => configs.forEach((c) => onUpdateSlot(c.slot, { saveTopKCount: n }))}
+                          className="h-8 text-sm w-16"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-6 flex-wrap">
+                      <div id={PIPELINE_FIELD_DEFS.checkpointMonitor.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.checkpointMonitor.label}
+                          <HintBubble text={PIPELINE_FIELD_DEFS.checkpointMonitor.hint} />
+                        </span>
+                        <Input
+                          type="text"
+                          value={firstHp.checkpointMonitor}
+                          onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { checkpointMonitor: e.target.value }))}
+                          className="h-8 text-sm w-32"
+                        />
+                      </div>
+                      <div id={PIPELINE_FIELD_DEFS.checkpointMode.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.checkpointMode.label}
+                          <HintBubble text={PIPELINE_FIELD_DEFS.checkpointMode.hint} />
+                        </span>
+                        <Select value={firstHp.checkpointMode} onValueChange={(v) => configs.forEach((c) => onUpdateSlot(c.slot, { checkpointMode: v as "min" | "max" }))}>
+                          <SelectTrigger className="h-8 text-sm w-20"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="min">Min</SelectItem>
+                            <SelectItem value="max">Max</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                    <div id={PIPELINE_FIELD_DEFS.visualization.id} data-search-field="" className="flex items-center gap-6 scroll-mt-4">
+                      <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                        {PIPELINE_FIELD_DEFS.visualization.label}:
+                        <HintBubble text={PIPELINE_FIELD_DEFS.visualization.hint} />
+                      </span>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={firstHp.visualizePredictions}
+                          onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { visualizePredictions: e.target.checked }))}
+                          className="accent-primary"
+                        />
+                        <span className="text-sm">Visualize Predictions</span>
+                      </label>
+                      <label className={`flex items-center gap-1.5 ${firstHp.visualizePredictions ? "cursor-pointer" : "cursor-not-allowed opacity-50"}`}>
+                        <input
+                          type="checkbox"
+                          checked={firstHp.keepVizImages}
+                          disabled={!firstHp.visualizePredictions}
+                          onChange={(e) => configs.forEach((c) => onUpdateSlot(c.slot, { keepVizImages: e.target.checked }))}
+                          className="accent-primary"
+                        />
+                        <span className="text-sm">Keep Viz Images</span>
+                      </label>
+                    </div>
+                    <div className="flex items-center gap-6 flex-wrap">
+                      <div id={PIPELINE_FIELD_DEFS.exportFormat.id} data-search-field="" className="flex items-center gap-2 scroll-mt-4">
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.exportFormat.label}
+                          <HintBubble text={PIPELINE_FIELD_DEFS.exportFormat.hint} />
+                        </span>
+                        <Select value={exportFormat} onValueChange={(v) => onExportFormatChange(v as "none" | "onnx" | "tensorrt")}>
+                          <SelectTrigger className="h-8 text-sm w-36"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="none">Don't export</SelectItem>
+                            <SelectItem value="onnx">ONNX</SelectItem>
+                            {/* Shown even off CUDA so users know the format exists; disabled
+                                items get pointer-events-none, so the reason goes in the label
+                                (a hover tooltip wouldn't fire). */}
+                            <SelectItem value="tensorrt" disabled={!trtAvailable}>
+                              {trtAvailable ? "TensorRT" : "TensorRT (requires NVIDIA GPU)"}
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <label id={PIPELINE_FIELD_DEFS.useExportedForInference.id} data-search-field="" className={`flex items-center gap-1.5 scroll-mt-4 ${exportFormat !== "none" ? "cursor-pointer" : "cursor-not-allowed opacity-50"}`}>
+                        <input
+                          type="checkbox"
+                          checked={exportFormat !== "none" && useExportedForInference}
+                          disabled={exportFormat === "none"}
+                          onChange={(e) => onUseExportedForInferenceChange(e.target.checked)}
+                          className="accent-primary"
+                        />
+                        <span className="text-sm text-muted-foreground flex items-center gap-1.5">
+                          {PIPELINE_FIELD_DEFS.useExportedForInference.label}
+                          <HintBubble text={PIPELINE_FIELD_DEFS.useExportedForInference.hint} />
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">Upload config files to configure output.</p>
+                )}
+
+                {mode !== "worker-file" && (
+                  <>
+                    <Separator className="my-5" />
+
+                    {/* 8. Remote Training */}
+                    <SectionHeading {...PIPELINE_FIELD_DEFS.secRemote} />
+                    <div className="max-w-64">
+                      <BackendPicker
+                        jobLabel="training job"
+                        remoteEnabled={remoteEnabled}
+                        onRemoteEnabledChange={onRemoteEnabledChange}
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
+            </TabsContent>
+
+            {/* ── Per-head tabs ── */}
+            {sortedConfigs.map((cf) => (
+              <TabsContent key={cf.slot} value={cf.slot} className="flex-1 min-h-0 mt-0 overflow-hidden h-full">
+                <HeadTabContent
+                  slot={cf.slot}
+                  modelType={modelType}
+                  configFile={cf}
+                  hp={cf.hyperparams}
+                  onUpdate={(updates) => onUpdateSlot(cf.slot, updates)}
+                  scrollRefCallback={(el) => { headScrollRefs.current[cf.slot] = el; }}
+                  labelsOverride={labelsOverride}
+                  remoteFrame={remoteFrame}
+                  configActions={configActions}
+                  mode={mode}
+                />
+              </TabsContent>
+            ))}
+          </div>
+          {/* Footer: reset (left) · PyQt's Copy / Save / Export package buttons · Done (right) */}
+          <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-3 border-t shrink-0">
+            <button
+              type="button"
+              onClick={handleResetDefaults}
+              className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              Reset to profile defaults…
+            </button>
+            {mode !== "worker-file" && (
+              <div className="flex flex-wrap items-center gap-2 ml-auto">
+                <button
+                  type="button"
+                  disabled={configBusy || sortedConfigs.length === 0}
+                  onClick={() => runConfigAction(copyTrainingConfigsToClipboard)}
+                  title="Copy every model's sleap-nn configuration (YAML) to the clipboard"
+                  className="px-3 h-8 rounded-md border text-sm hover:bg-muted disabled:opacity-50 disabled:pointer-events-none"
+                >
+                  Copy to clipboard
+                </button>
+                <button
+                  type="button"
+                  disabled={configBusy || sortedConfigs.length === 0}
+                  onClick={() => runConfigAction(saveTrainingConfigFiles)}
+                  title={isTauri
+                    ? "Save the configuration files and scripts to run training and inference yourself"
+                    : "Download the configuration files and scripts (as a .zip) to run training and inference yourself. Put your saved .slp file in the same folder before running them."}
+                  className="px-3 h-8 rounded-md border text-sm hover:bg-muted disabled:opacity-50 disabled:pointer-events-none"
+                >
+                  Save configuration files…
+                </button>
+                <button
+                  type="button"
+                  disabled={configBusy || sortedConfigs.length === 0 || !labels}
+                  onClick={() => runConfigAction(exportTrainingJobPackage)}
+                  title="Save a .zip with the labeled frames (images included), the configuration files and scripts, to train on another computer"
+                  className="px-3 h-8 rounded-md border text-sm hover:bg-muted disabled:opacity-50 disabled:pointer-events-none"
+                >
+                  Export Training Job Package…
+                </button>
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => { onClose(); setSearchQuery(""); }}
+              className="px-4 h-8 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90"
+            >
+              Done
+            </button>
+          </div>
+        </Tabs>
+      </DialogContent>
+    </Dialog>
+  );
+}

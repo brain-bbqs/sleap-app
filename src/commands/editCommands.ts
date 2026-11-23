@@ -1,0 +1,1094 @@
+/**
+ * Edit commands: instance creation, deletion, copy/paste, point manipulation,
+ * and prediction-to-instance conversion.
+ *
+ * Ports SLEAP's AddInstance, DeleteSelectedInstance, CopyInstance, PasteInstance,
+ * SetInstancePointLocations, DeleteFramePredictions, ConvertPredictionToInstance.
+ */
+
+import { frameHasContent } from "@/lib/frameLabeling";
+import { Instance, LabeledFrame, PredictedInstance } from "@talmolab/sleap-io.js";
+import type { Labels, Skeleton } from "@talmolab/sleap-io.js";
+import { UpdateTopic } from "../types";
+import type { Command } from "./types";
+import type { CommandContext } from "./CommandContext";
+import { useAppStore } from "../stores/appStore";
+import { toast } from "@/lib/notify";
+import {
+  showLabelingHint,
+  hintIfFirstInstance,
+  hintIfFirstPredictionConversion,
+} from "@/lib/labelingHints";
+import {
+  placeInstance,
+  findNearestPriorFrame,
+  fillMissingPredictedNodes,
+  fillMissingUserNodes,
+  centerInstanceAt,
+} from "@/lib/instancePlacement";
+
+/**
+ * Create a new Instance on the current frame using the selected placement
+ * method.
+ *
+ * Params:
+ *   location?: [number, number] - scene/frame coordinates to center the new
+ *     instance on (e.g. the right-click point that opened "Add Instance" in
+ *     the context menu). When omitted (menu bar / hotkey invocation), the
+ *     configured placement method's own default anchor is used unchanged.
+ */
+export const AddInstance: Command = {
+  name: "AddInstance",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video, frameIdx, skeleton } = ctx.state;
+    if (!labels || !video || !skeleton) return;
+
+    // A skeleton with no nodes would yield a null instance (zero points, zero
+    // edges). PyQt SLEAP forbids this; refuse it here too and tell the user why.
+    if (skeleton.nodes.length === 0) {
+      toast.info("Add at least one node to the skeleton before adding an instance.");
+      return;
+    }
+
+    // Get the placement method from app settings
+    const method = useAppStore.getState().instanceInitMethod;
+
+    // Get existing instances on the current frame
+    const currentFrames = labels.find({ video, frameIdx });
+    const existingInstances =
+      currentFrames.length > 0 ? currentFrames[0].instances : [];
+
+    const priorFrame = findNearestPriorFrame(labels, video, frameIdx);
+
+    // Create instance using the selected placement method. When the visual
+    // skeleton builder has captured a drawn layout this session, the
+    // center-based methods seed geometry from that drawn orientation instead of
+    // the scrambled circle (session-only; null on a fresh session).
+    const instance = placeInstance(
+      method,
+      skeleton,
+      video,
+      existingInstances,
+      priorFrame,
+      useAppStore.getState().visibleSceneRect,
+      useAppStore.getState().skeletonTemplateLayout
+    );
+
+    const location = params?.location as [number, number] | undefined;
+    if (location) {
+      centerInstanceAt(instance, location);
+    }
+
+    // Find or create the LabeledFrame for this video + frame
+    let lf: LabeledFrame;
+    if (currentFrames.length > 0) {
+      lf = currentFrames[0];
+    } else {
+      lf = new LabeledFrame({ video, frameIdx });
+      labels.append(lf);
+    }
+
+    lf.instances.push(instance);
+    // A frame with an animal on it isn't a background frame any more (SLEAP #2894).
+    if (lf.isNegative) {
+      lf.isNegative = false;
+      ctx.state.bumpOverlayVersion();
+    }
+
+    // Select the new instance and update state
+    ctx.state.setLabeledFrame(lf);
+    ctx.state.setInstance(instance);
+    ctx.state.markChanged();
+
+    // Only enter placement mode if instance has unplaced (NaN) points
+    const hasNaNPoints = instance.points.some(
+      (p) => isNaN(p.xy[0]) || isNaN(p.xy[1])
+    );
+    if (hasNaNPoints) {
+      useAppStore.getState().enterPlacementMode();
+    }
+
+    // #341: exactly one hint per call. The very first user instance in the
+    // whole project is its own milestone (hintIfFirstInstance) and takes
+    // priority over the frame-based ones below — showing both at once would
+    // stack right on top of the node-confirmed-color hint the user is about
+    // to trigger by dragging this instance's (all-red) nodes into place.
+    if (!hintIfFirstInstance(labels)) {
+      // #341: picked by what's actually on the frame — converting a
+      // prediction beats cloning a user instance beats a bare repositioning
+      // tip, since each is progressively less specific to this frame's
+      // contents.
+      if (existingInstances.some((inst) => inst instanceof PredictedInstance)) {
+        // Drawing from scratch when a prediction is already sitting right
+        // there is almost always slower than double-clicking it.
+        showLabelingHint("double-click-to-convert");
+      } else if (existingInstances.length > 0) {
+        // A similarly-posed user instance is already here — cloning it
+        // (Ctrl/Cmd-drag) usually beats placing points from scratch.
+        showLabelingHint("clone-instance-drag");
+      } else {
+        // Nothing to convert or clone (first instance on this frame) — teach
+        // bulk repositioning instead of node-by-node dragging.
+        showLabelingHint("move-rotate-whole-instance");
+      }
+    }
+  },
+};
+
+/**
+ * Toggle the current frame's "negative" (background) flag — a frame explicitly
+ * marked as having no animal, used as a negative training example. Creates an
+ * empty flagged frame if none exists; turning the flag off prunes a frame that
+ * only existed to hold it. Undoable (the snapshot captures `isNegative`).
+ */
+export const ToggleNegativeFrame: Command = {
+  name: "ToggleNegativeFrame",
+  topics: [UpdateTopic.Frame, UpdateTopic.Labels],
+  execute(ctx: CommandContext) {
+    const { labels, video, frameIdx } = ctx.state;
+    if (!labels || !video) return;
+
+    const lf = labels.find({ video, frameIdx })[0];
+
+    if (!lf) {
+      const created = new LabeledFrame({ video, frameIdx, isNegative: true });
+      labels.append(created);
+      ctx.state.setLabeledFrame(created);
+      // Seekbar marks + canvas overlays recompute only when overlayVersion
+      // changes (labels is mutated in place). A menu/shortcut toggle has no
+      // canvas path to bump it, so bump explicitly or the tick goes stale.
+      ctx.state.bumpOverlayVersion();
+      ctx.state.markChanged();
+      return;
+    }
+
+    lf.isNegative = !lf.isNegative;
+    // A negative frame has no animals by definition, so marking one removes
+    // its instances, user and predicted alike, like SLEAP (#2894). The UI asks
+    // first (`requestToggleNegativeFrame`); undo restores them.
+    if (lf.isNegative && lf.instances.length > 0) {
+      lf.instances.splice(0, lf.instances.length);
+      ctx.state.setInstance(null);
+    }
+
+    // Turning OFF an otherwise-empty frame prunes it (it only held the flag).
+    if (!lf.isNegative && lf.instances.length === 0) {
+      const idx = labels.labeledFrames.indexOf(lf);
+      if (idx !== -1) labels.labeledFrames.splice(idx, 1);
+      ctx.state.setLabeledFrame(null);
+    } else {
+      ctx.state.setLabeledFrame(lf);
+    }
+    // See note above: notify overlay/seekbar consumers so the tick repaints.
+    ctx.state.bumpOverlayVersion();
+    ctx.state.markChanged();
+  },
+};
+
+/** Remove the currently selected instance from its frame. */
+export const DeleteSelectedInstance: Command = {
+  name: "DeleteSelectedInstance",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  execute(ctx: CommandContext) {
+    const { labels, video, frameIdx, instance } = ctx.state;
+    if (!labels || !video || !instance) return;
+
+    const frames = labels.find({ video, frameIdx });
+    if (frames.length === 0) return;
+
+    const lf = frames[0];
+    const idx = lf.instances.indexOf(instance);
+    if (idx === -1) return;
+
+    lf.instances.splice(idx, 1);
+
+    // Clear selection
+    ctx.state.setInstance(null);
+    // Keep showing the frame while it still has boxes (or other annotations).
+    ctx.state.setLabeledFrame(frameHasContent(lf) ? lf : null);
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Update a point's x,y coordinates on the selected instance.
+ *
+ * Params:
+ *   nodeIdx: number - index of the node/point to update
+ *   x: number - new x coordinate
+ *   y: number - new y coordinate
+ */
+export const SetPointLocation: Command = {
+  name: "SetPointLocation",
+  topics: [], // No redraw topics - canvas handles this directly for drag perf
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { instance } = ctx.state;
+    if (!instance) return;
+
+    const nodeIdx = params?.nodeIdx;
+    const x = params?.x;
+    const y = params?.y;
+
+    if (typeof nodeIdx !== "number" || typeof x !== "number" || typeof y !== "number") {
+      return;
+    }
+
+    if (nodeIdx < 0 || nodeIdx >= instance.points.length) return;
+
+    instance.points[nodeIdx].xy = [x, y];
+    instance.points[nodeIdx].visible = true;
+    instance.points[nodeIdx].complete = true;
+
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Batch node edit on the selected instance, as one undo step. Used to apply a
+ * fix Claude proposed and the user accepted (QC review).
+ *
+ * Params:
+ *   nodes: { [nodeIdx]: [x, y] | null } - source-frame coordinates; null marks
+ *     the node not visible (its position is kept, like V does).
+ *   instance?: Instance - the instance to edit (default: the selected one). It
+ *     must be on the frame on screen, which is what the undo snapshot covers.
+ */
+export const SetNodes: Command = {
+  name: "SetNodes",
+  // Instance makes it count as an edit even if Frame/View-only commands stop
+  // being treated as mutating (#468). Same topics as ConvertPredictionToInstance.
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const instance = (params?.instance as Instance | undefined) ?? ctx.state.instance;
+    const nodes = params?.nodes as Record<string, [number, number] | null> | undefined;
+    if (!instance || !nodes) return;
+    // An instance off the frame on screen wouldn't be in the undo snapshot.
+    if (params?.instance && !ctx.state.labeledFrame?.instances.includes(instance)) return;
+    for (const [k, v] of Object.entries(nodes)) {
+      const p = instance.points[Number(k)];
+      if (!p) continue;
+      if (v === null) {
+        p.visible = false;
+        continue;
+      }
+      p.xy = [v[0], v[1]];
+      p.visible = true;
+      p.complete = true;
+    }
+    ctx.state.markChanged();
+    ctx.state.bumpOverlayVersion();
+  },
+};
+
+/** Deep-copy a point array. */
+function clonePoints(points: Instance["points"]): Instance["points"] {
+  return points.map((p) => ({
+    xy: [p.xy[0], p.xy[1]] as [number, number],
+    visible: p.visible,
+    complete: p.complete,
+    name: p.name,
+    score: p.score,
+  }));
+}
+
+/**
+ * Clone a predicted instance's points for conversion to a user Instance,
+ * forcing `visible` to match sleap_io's canonical rule (`visible = !isNaN(x)`)
+ * rather than trusting the model's `visible` flag as-is. A model can emit
+ * `visible: true` for a keypoint it failed to place (`xy: [NaN, NaN]`); left
+ * uncorrected, the renderer tries to draw a filled marker at NaN and nothing
+ * appears at all, instead of the hollow "invisible node" marker it draws for
+ * genuinely non-visible points.
+ */
+function clonePredictedPoints(points: Instance["points"]): Instance["points"] {
+  return points.map((p) => ({
+    xy: [p.xy[0], p.xy[1]] as [number, number],
+    visible: !Number.isNaN(p.xy[0]),
+    complete: p.complete,
+    name: p.name,
+    score: p.score,
+  }));
+}
+
+/** Copy the selected instance's point data to the clipboard. */
+export const CopyInstance: Command = {
+  name: "CopyInstance",
+  topics: [],
+  execute(ctx: CommandContext) {
+    const { instance } = ctx.state;
+    if (!instance) return;
+
+    const clone = new Instance({
+      skeleton: instance.skeleton,
+      points: clonePoints(instance.points),
+      track: instance.track,
+    });
+    ctx.setState({ clipboardInstance: clone });
+  },
+};
+
+/**
+ * The skeleton a copy of `source` should get: the source's own skeleton when it
+ * belongs to this project (points are positional, so a pasted mouse must stay a
+ * mouse even while the pellet skeleton is active), else the active skeleton
+ * (e.g. a clipboard instance copied from a previously open project).
+ */
+function skeletonForCopy(
+  labels: Labels,
+  source: Instance,
+  active: Skeleton | null,
+): Skeleton | null {
+  return labels.skeletons.includes(source.skeleton) ? source.skeleton : active;
+}
+
+/** Paste the clipboard instance onto the current frame. */
+export const PasteInstance: Command = {
+  name: "PasteInstance",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  execute(ctx: CommandContext) {
+    const { labels, video, frameIdx, clipboardInstance } = ctx.state;
+    if (!labels || !video || !clipboardInstance) return;
+    const skeleton = skeletonForCopy(labels, clipboardInstance, ctx.state.skeleton);
+    if (!skeleton) return;
+
+    // Never materialize a node-less instance (see AddInstance).
+    if (skeleton.nodes.length === 0) {
+      toast.info("Add at least one node to the skeleton before pasting an instance.");
+      return;
+    }
+
+    const newInstance = new Instance({
+      skeleton,
+      points: clonePoints(clipboardInstance.points),
+      track: clipboardInstance.track,
+    });
+
+    // Find or create the LabeledFrame
+    const frames = labels.find({ video, frameIdx });
+    let lf: LabeledFrame;
+    if (frames.length > 0) {
+      lf = frames[0];
+    } else {
+      lf = new LabeledFrame({ video, frameIdx });
+      labels.append(lf);
+    }
+
+    lf.instances.push(newInstance);
+    ctx.state.setLabeledFrame(lf);
+    ctx.state.setInstance(newInstance);
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Duplicate an instance onto the current frame, selecting the copy. Backs the
+ * canvas's Ctrl+drag "clone and drag" gesture, mirroring PyQt SLEAP's
+ * `QtInstance.mousePressEvent` (Ctrl+click -> `duplicate_instance()` ->
+ * `context.newInstance(copy_instance=self.instance)`).
+ *
+ * Params:
+ *   instance: Instance - the source instance to clone.
+ */
+export const DuplicateInstance: Command = {
+  name: "DuplicateInstance",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video, frameIdx } = ctx.state;
+    const source = params?.instance as Instance | undefined;
+    if (!labels || !video || !source) return;
+    const skeleton = skeletonForCopy(labels, source, ctx.state.skeleton);
+    if (!skeleton) return;
+
+    const newInstance = new Instance({
+      skeleton,
+      points: clonePoints(source.points),
+      track: source.track,
+    });
+
+    const frames = labels.find({ video, frameIdx });
+    let lf: LabeledFrame;
+    if (frames.length > 0) {
+      lf = frames[0];
+    } else {
+      lf = new LabeledFrame({ video, frameIdx });
+      labels.append(lf);
+    }
+
+    lf.instances.push(newInstance);
+    ctx.state.setLabeledFrame(lf);
+    ctx.state.setInstance(newInstance);
+    ctx.state.markChanged();
+  },
+};
+
+/** Delete all predicted instances on the current frame. */
+export const DeleteFramePredictions: Command = {
+  name: "DeleteFramePredictions",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  execute(ctx: CommandContext) {
+    const { labels, video, frameIdx, instance } = ctx.state;
+    if (!labels || !video) return;
+
+    const frames = labels.find({ video, frameIdx });
+    if (frames.length === 0) return;
+
+    const lf = frames[0];
+    const userInstances = lf.instances.filter((inst) => !(inst instanceof PredictedInstance));
+    lf.instances = userInstances;
+
+    // If selected instance was predicted, deselect
+    if (instance instanceof PredictedInstance) {
+      ctx.state.setInstance(null);
+    }
+    ctx.state.setLabeledFrame(userInstances.length > 0 ? lf : null);
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Convert a predicted instance to a user instance.
+ *
+ * Params:
+ *   instanceIdx: number - index of the predicted instance in the labeled frame
+ *   markComplete?: boolean - mark every predicted node complete (Shift+double-click)
+ *
+ * Clones the predicted instance's points into a new user Instance,
+ * replaces the predicted one in the frame, and selects the new instance.
+ */
+export const ConvertPredictionToInstance: Command = {
+  name: "ConvertPredictionToInstance",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video, frameIdx } = ctx.state;
+    if (!labels || !video) return;
+
+    const instanceIdx = params?.instanceIdx;
+    if (typeof instanceIdx !== "number") return;
+
+    const frames = labels.find({ video, frameIdx });
+    if (frames.length === 0) return;
+
+    const lf = frames[0];
+    const predicted = lf.instances[instanceIdx];
+    if (!predicted || !(predicted instanceof PredictedInstance)) return;
+
+    // Clone as a user Instance (no score property), keeping the fromPredicted
+    // link so the user→prediction provenance round-trips to the SLP (Python
+    // parity — sleap-io.js persists Instance.fromPredicted).
+    const userInstance = new Instance({
+      skeleton: predicted.skeleton,
+      points: clonePredictedPoints(predicted.points),
+      track: predicted.track,
+      fromPredicted: predicted,
+    });
+    const hadMissingNodes = userInstance.points.some(
+      (p) => isNaN(p.xy[0]) || isNaN(p.xy[1])
+    );
+    // Shift+double-click: accept with every predicted node already marked
+    // complete, as PyQt SLEAP does (`newInstance(mark_complete=True)`).
+    // Nodes the model didn't place stay incomplete.
+    if (params?.markComplete === true) {
+      for (const p of userInstance.points) {
+        if (!isNaN(p.xy[0]) && !isNaN(p.xy[1])) p.complete = true;
+      }
+    }
+    fillMissingPredictedNodes(userInstance);
+
+    // Replace the predicted instance with the user instance
+    lf.instances.splice(instanceIdx, 1, userInstance);
+
+    ctx.state.setLabeledFrame(lf);
+    ctx.state.setInstance(userInstance);
+    ctx.state.markChanged();
+
+    // #341: same one-hint-at-a-time reasoning as AddInstance — the
+    // first-ever-instance milestone takes priority, then the first-ever
+    // conversion of the session (explains why this already-positioned
+    // instance still starts red), then the missing-nodes nudge. Stacking any
+    // two of these would compete with the node-confirmed-color hint the user
+    // is about to trigger by dragging one of this instance's red nodes.
+    if (!hintIfFirstInstance(labels) && !hintIfFirstPredictionConversion() && hadMissingNodes) {
+      showLabelingHint("missing-nodes-right-click");
+    }
+  },
+};
+
+const isUserInstance = (inst: unknown): inst is Instance =>
+  inst instanceof Instance && !(inst instanceof PredictedInstance);
+
+const hasPoint = (p: { xy: [number, number] }) =>
+  Number.isFinite(p.xy[0]) && Number.isFinite(p.xy[1]);
+
+/**
+ * Merge another user instance on the current frame into the selected one
+ * (Labels ▸ Merge Instance, Shift+M; right-click ▸ Merge Instance with ▸;
+ * or pick two rows in the Instances panel). Ports PyQt SLEAP's
+ * `MergeInstances` (../sleap/sleap/gui/commands.py), e.g. to combine a
+ * "front half" and a "back half" instance of one animal.
+ *
+ * The survivor (the selected instance, or `params.survivor`) is kept with its
+ * own track. For every node the survivor is missing (no position, or not
+ * visible) and the donor has visible, the donor's position, visibility and
+ * completeness are copied over. Where both have the node, the survivor's wins.
+ * The donor is then removed. Predicted instances never take part.
+ *
+ * The donor is `params.donor`, else the Instances panel's second pick
+ * (`mergePartner`), else — when the frame has exactly two user instances —
+ * the other one. One undo step.
+ *
+ * Params:
+ *   survivor?: Instance
+ *   donor?: Instance
+ */
+export const MergeInstance: Command = {
+  name: "MergeInstance",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video, frameIdx } = ctx.state;
+    if (!labels || !video) return;
+    const lf = labels.find({ video, frameIdx })[0];
+    if (!lf) return;
+
+    const survivor = (params?.survivor as Instance | undefined) ?? ctx.state.instance;
+    if (!survivor || !isUserInstance(survivor) || !lf.instances.includes(survivor)) {
+      toast.info("Merge Instance: select a user instance first.");
+      return;
+    }
+
+    const userInstances = lf.instances.filter(isUserInstance);
+    if (userInstances.length < 2) {
+      toast.info("Merge Instance: need at least two user instances on the frame.");
+      return;
+    }
+
+    let donor = (params?.donor as Instance | undefined) ?? ctx.state.mergePartner ?? undefined;
+    if (donor && (donor === survivor || !lf.instances.includes(donor))) donor = undefined;
+    if (!donor && userInstances.length === 2) {
+      donor = userInstances.find((inst) => inst !== survivor);
+    }
+    if (!donor || !isUserInstance(donor)) {
+      toast.info(
+        "Merge Instance: pick the instance to merge in — right-click ▸ Merge Instance with, " +
+          "or Cmd/Ctrl+click a second row in the Instances panel."
+      );
+      return;
+    }
+
+    const sNodes = survivor.skeleton.nodes.map((n) => n.name);
+    const dNodes = donor.skeleton.nodes.map((n) => n.name);
+    if (sNodes.length !== dNodes.length || sNodes.some((name, i) => name !== dNodes[i])) {
+      toast.info("Merge Instance: the instances have different skeletons.");
+      return;
+    }
+
+    ctx.pushUndoSnapshot(ctx.takeSnapshot("MergeInstance"));
+
+    survivor.points.forEach((s, i) => {
+      const d = donor.points[i];
+      if (!d) return;
+      const survivorMissing = !hasPoint(s) || !s.visible;
+      const donorLabeled = hasPoint(d) && d.visible;
+      if (survivorMissing && donorLabeled) {
+        s.xy = [d.xy[0], d.xy[1]];
+        s.visible = d.visible;
+        s.complete = d.complete;
+      }
+    });
+
+    // Remove the donor by identity (never by pose: after the merge the two
+    // can be identical).
+    lf.instances = lf.instances.filter((inst) => inst !== donor);
+
+    ctx.state.setLabeledFrame(lf);
+    ctx.state.setInstance(survivor);
+    ctx.state.setMergePartner(null);
+    ctx.state.markChanged();
+    ctx.state.touchFrame();
+    ctx.state.bumpOverlayVersion();
+  },
+};
+
+/**
+ * Give the user instance's missing nodes a position (double-click a user
+ * instance), as PyQt SLEAP's `AddMissingInstanceNodes` does — e.g. after a
+ * node was added to the skeleton, or for nodes left unplaced. They're placed
+ * from the project's other user instances (see `fillMissingUserNodes`) as
+ * non-visible, incomplete nodes to drag into place. No-op (and no undo step)
+ * when nothing is missing.
+ *
+ * Params:
+ *   instance?: Instance - defaults to the selected instance
+ */
+export const AddMissingInstanceNodes: Command = {
+  name: "AddMissingInstanceNodes",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { labels, video, frameIdx } = ctx.state;
+    const instance = (params?.instance as Instance | undefined) ?? ctx.state.instance;
+    if (!labels || !video || !instance || !isUserInstance(instance)) return;
+    if (instance.points.every(hasPoint)) return;
+
+    ctx.pushUndoSnapshot(ctx.takeSnapshot("AddMissingInstanceNodes"));
+
+    const rect = useAppStore.getState().visibleSceneRect;
+    const center: [number, number] | null = rect
+      ? [(rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2]
+      : null;
+    const added = fillMissingUserNodes(instance, labels, video, frameIdx, center);
+    if (added === 0) return;
+
+    ctx.state.setInstance(instance);
+    ctx.state.markChanged();
+    ctx.state.touchFrame();
+    ctx.state.bumpOverlayVersion();
+
+    if (!useAppStore.getState().showNonVisibleNodes) {
+      toast.info(
+        `Added ${added} missing node${added > 1 ? "s" : ""} as non-visible. ` +
+          "Turn on View ▸ Show Non-Visible Nodes (Shift+V) to see and drag them."
+      );
+    }
+  },
+};
+
+/**
+ * Mark every placed node of a user instance complete (Shift+click a node), as
+ * PyQt SLEAP's `QtNode.mousePressEvent` does with Shift held. Positions and
+ * visibility are unchanged. No undo step when all are already complete.
+ *
+ * Params:
+ *   instance?: Instance - defaults to the selected instance
+ */
+export const MarkInstanceComplete: Command = {
+  name: "MarkInstanceComplete",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const instance = (params?.instance as Instance | undefined) ?? ctx.state.instance;
+    if (!instance || !isUserInstance(instance)) return;
+    const pending = instance.points.filter((p) => hasPoint(p) && !p.complete);
+    if (pending.length === 0) return;
+
+    ctx.pushUndoSnapshot(ctx.takeSnapshot("MarkInstanceComplete"));
+    for (const p of pending) p.complete = true;
+
+    ctx.state.markChanged();
+    ctx.state.touchFrame();
+    ctx.state.bumpOverlayVersion();
+  },
+};
+
+/**
+ * Accept ALL predicted instances on the current frame as user instances in one
+ * action (PyQt "Add Instances from All Predictions on Current Frame").
+ *
+ * REPLACE-in-place — each predicted instance is swapped for a cloned user
+ * Instance at the same position — to match this app's single-instance
+ * double-click accept ({@link ConvertPredictionToInstance}) rather than PyQt's
+ * append-alongside. Non-predicted instances are left untouched. Provenance
+ * (fromPredicted) and track are preserved. Single-frame op → single-frame undo.
+ */
+export const AddInstancesFromAllPredictions: Command = {
+  name: "AddInstancesFromAllPredictions",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  // Manage our own snapshot so a no-predictions invocation (e.g. via hotkey)
+  // doesn't leave a spurious no-op entry on the undo stack.
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext) {
+    const { labels, video, frameIdx } = ctx.state;
+    if (!labels || !video) return;
+
+    const frames = labels.find({ video, frameIdx });
+    if (frames.length === 0) return;
+
+    const lf = frames[0];
+    const predictedCount = lf.instances.filter(
+      (inst) => inst instanceof PredictedInstance
+    ).length;
+    if (predictedCount === 0) {
+      toast.info("No predictions on this frame to accept.");
+      return;
+    }
+
+    // Snapshot BEFORE mutating (single frame) for undo.
+    const snapshot = ctx.takeSnapshot("AddInstancesFromAllPredictions");
+    ctx.pushUndoSnapshot(snapshot);
+
+    // Swap each predicted instance in place for a user Instance, keeping the
+    // fromPredicted link (Python-parity provenance) and track.
+    let firstConverted: Instance | null = null;
+    lf.instances = lf.instances.map((inst) => {
+      if (!(inst instanceof PredictedInstance)) return inst;
+      const userInstance = new Instance({
+        skeleton: inst.skeleton,
+        points: clonePredictedPoints(inst.points),
+        track: inst.track,
+        fromPredicted: inst,
+      });
+      fillMissingPredictedNodes(userInstance);
+      if (!firstConverted) firstConverted = userInstance;
+      return userInstance;
+    });
+
+    ctx.state.setLabeledFrame(lf);
+    if (firstConverted) ctx.state.setInstance(firstConverted);
+    ctx.state.markChanged();
+
+    toast.success(
+      `Accepted ${predictedCount} prediction${predictedCount > 1 ? "s" : ""} as ` +
+        `user instance${predictedCount > 1 ? "s" : ""}`
+    );
+    if (!hintIfFirstInstance(labels)) hintIfFirstPredictionConversion();
+  },
+};
+
+/**
+ * Accept ALL predicted instances across every labeled frame in the project
+ * (all videos, not just the current one) as user instances, in one action
+ * (PyQt "Accept All Predictions" — {@link AddInstancesFromAllPredictions}
+ * above is this app's per-current-frame analogue of PyQt's
+ * `AddUserInstancesFromPredictions`; this is the per-project analogue of
+ * `AddUserInstancesFromAllPredictions` in ../sleap/sleap/gui/commands.py).
+ *
+ * REPLACE-in-place per frame, same as the current-frame version above, for
+ * internal consistency — PyQt appends the new user instance alongside the
+ * prediction instead of replacing it; see that command's docstring for why
+ * this app doesn't.
+ */
+export const AddInstancesFromAllPredictionsInProject: Command = {
+  name: "AddInstancesFromAllPredictionsInProject",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext) {
+    const { labels } = ctx.state;
+    if (!labels) return;
+
+    const framesWithPredictions = labels.labeledFrames.filter((lf) =>
+      lf.instances.some((inst) => inst instanceof PredictedInstance)
+    );
+    if (framesWithPredictions.length === 0) {
+      toast.info("No predictions in this project to accept.");
+      return;
+    }
+
+    const snapshot = ctx.takeAllFramesSnapshot("AddInstancesFromAllPredictionsInProject");
+
+    let totalAccepted = 0;
+    for (const lf of framesWithPredictions) {
+      lf.instances = lf.instances.map((inst) => {
+        if (!(inst instanceof PredictedInstance)) return inst;
+        const userInstance = new Instance({
+          skeleton: inst.skeleton,
+          points: clonePredictedPoints(inst.points),
+          track: inst.track,
+          fromPredicted: inst,
+        });
+        fillMissingPredictedNodes(userInstance);
+        totalAccepted++;
+        return userInstance;
+      });
+    }
+
+    ctx.pushUndoSnapshot(snapshot);
+    ctx.state.markChanged();
+
+    toast.success(
+      `Accepted ${totalAccepted} prediction${totalAccepted > 1 ? "s" : ""} across ` +
+        `${framesWithPredictions.length} frame${framesWithPredictions.length > 1 ? "s" : ""}`
+    );
+    if (!hintIfFirstInstance(labels)) hintIfFirstPredictionConversion();
+  },
+};
+
+/**
+ * No-op mutating command to create an undo snapshot before a continuous edit
+ * operation (drag, placement). Since it has topics, CommandContext.execute()
+ * will auto-snapshot the current frame state before calling execute().
+ * The actual mutations happen directly on the data model during the drag.
+ */
+export const BeginEdit: Command = {
+  name: "BeginEdit",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  execute() {
+    // Intentionally empty - the snapshot is the point
+  },
+};
+
+/**
+ * Toggle node visibility on the current frame (V key, right-click, context
+ * menu). Every toggle path goes through here so each one is undoable.
+ *
+ * Params:
+ *   nodes: { instanceIdx: number; nodeIdx: number }[] - indices into the
+ *     current labeled frame's instances and that instance's points.
+ *
+ * A single node flips. Several nodes all move to one state — visible unless
+ * more than half already are — so a mixed selection converges instead of
+ * every node flipping independently.
+ */
+export const ToggleNodeVisibility: Command = {
+  name: "ToggleNodeVisibility",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const lf = ctx.state.labeledFrame;
+    const nodes = params?.nodes;
+    if (!lf || !Array.isArray(nodes)) return;
+
+    const points = (nodes as { instanceIdx: number; nodeIdx: number }[])
+      .map(({ instanceIdx, nodeIdx }) => lf.instances[instanceIdx]?.points[nodeIdx])
+      .filter((p) => p !== undefined);
+    if (points.length === 0) return;
+
+    const visibleCount = points.filter((p) => p.visible).length;
+    const makeVisible = visibleCount <= points.length / 2;
+    for (const point of points) point.visible = makeVisible;
+
+    ctx.state.markChanged();
+    ctx.state.touchFrame();
+    ctx.state.bumpOverlayVersion();
+  },
+};
+
+/**
+ * Move an entire instance by a delta.
+ *
+ * Params:
+ *   dx: number - x offset
+ *   dy: number - y offset
+ */
+export const MoveInstance: Command = {
+  name: "MoveInstance",
+  topics: [], // No redraw topics - caller handles re-render
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { instance } = ctx.state;
+    if (!instance) return;
+
+    const dx = params?.dx;
+    const dy = params?.dy;
+    if (typeof dx !== "number" || typeof dy !== "number") return;
+
+    for (const point of instance.points) {
+      if (!isNaN(point.xy[0]) && !isNaN(point.xy[1])) {
+        point.xy = [point.xy[0] + dx, point.xy[1] + dy];
+      }
+    }
+
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * Rotate all points in the selected instance around its centroid.
+ *
+ * Params:
+ *   angle: number - rotation angle in radians
+ */
+export const RotateInstance: Command = {
+  name: "RotateInstance",
+  topics: [UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext, params?: Record<string, unknown>) {
+    const { instance } = ctx.state;
+    if (!instance || instance instanceof PredictedInstance) return;
+
+    const angle = params?.angle;
+    if (typeof angle !== "number") return;
+
+    // Compute centroid of visible points
+    const visible = instance.points.filter(
+      (p) => !isNaN(p.xy[0]) && !isNaN(p.xy[1])
+    );
+    if (visible.length === 0) return;
+
+    const cx = visible.reduce((s, p) => s + p.xy[0], 0) / visible.length;
+    const cy = visible.reduce((s, p) => s + p.xy[1], 0) / visible.length;
+
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+
+    for (const point of instance.points) {
+      if (isNaN(point.xy[0]) || isNaN(point.xy[1])) continue;
+      const dx = point.xy[0] - cx;
+      const dy = point.xy[1] - cy;
+      point.xy = [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
+    }
+
+    ctx.state.markChanged();
+  },
+};
+
+/** Delete all predicted instances across all frames. */
+export const DeleteAllPredictions: Command = {
+  name: "DeleteAllPredictions",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  execute(ctx: CommandContext) {
+    const { labels, instance } = ctx.state;
+    if (!labels) return;
+
+    // Take a multi-frame snapshot BEFORE deletion for proper undo
+    const snapshot = ctx.takeAllFramesSnapshot("DeleteAllPredictions");
+
+    let removed = 0;
+    for (const lf of labels.labeledFrames) {
+      const before = lf.instances.length;
+      lf.instances = lf.instances.filter((inst) => !(inst instanceof PredictedInstance));
+      removed += before - lf.instances.length;
+    }
+
+    // Remove empty labeled frames
+    labels.labeledFrames = labels.labeledFrames.filter(frameHasContent);
+
+    if (removed === 0) return;
+
+    // Push the multi-frame snapshot for undo
+    ctx.pushUndoSnapshot(snapshot);
+
+    // If selected instance was predicted, deselect
+    if (instance instanceof PredictedInstance) {
+      ctx.state.setInstance(null);
+    }
+    ctx.state.markChanged();
+  },
+};
+
+/**
+ * How inference output combines with the project's EXISTING predictions.
+ * Mirrors legacy SLEAP's "Existing predictions" choice
+ * (sleap/gui/widgets/frame_target_selector.py + runners.merge_results):
+ *  - `replace` (default): per-frame, scoped to frames the model produced output
+ *    for — keep user instances, drop that frame's old predictions, add the new
+ *    ones (io `frame:"replace_predictions"`). Frames not re-inferred keep theirs.
+ *  - `clear_all`: delete EVERY predicted instance project-wide first (keep user
+ *    instances, drop now-empty frames), then append the new predictions
+ *    (io `frame:"keep_both"`).
+ *  - `keep`: append new predictions on top of existing ones (io `frame:"keep_both"`);
+ *    may create duplicates.
+ * User-labeled instances are never removed in any mode.
+ */
+export type ExistingPredictionsMode = "clear_all" | "replace" | "keep";
+
+/**
+ * Merge predictions from inference output into the current labels, honoring the
+ * "Existing predictions" mode (clear_all / replace / keep — default replace).
+ */
+export const MergePredictions: Command = {
+  name: "MergePredictions",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  async execute(ctx, params) {
+    const { labels } = ctx.state;
+    if (!labels) return;
+
+    const predictions = params?.predictions as Labels;
+    if (!predictions) return;
+
+    const mode = (params?.mode as ExistingPredictionsMode) ?? "replace";
+    // `replace` swaps predictions only on frames present in the new output;
+    // `keep`/`clear_all` append (the project-wide wipe below handles clear_all).
+    const frame = mode === "replace" ? "replace_predictions" : "keep_both";
+
+    const snapshot = ctx.takeAllFramesSnapshot("MergePredictions");
+
+    // clear_all: strip every existing PredictedInstance project-wide (keeping
+    // user instances) BEFORE merging, so stale predictions on frames the new
+    // run didn't cover are removed too — io's Labels.merge only visits frames
+    // present in the output, so a per-frame strategy alone can't reach them.
+    if (mode === "clear_all") {
+      for (const lf of labels.labeledFrames) {
+        lf.instances = lf.instances.filter(
+          (inst) => !(inst instanceof PredictedInstance)
+        );
+        // A box detector's predictions are boxes: clear those too.
+        lf.bboxes = lf.bboxes.filter((b) => !b.isPredicted);
+      }
+      labels.labeledFrames = labels.labeledFrames.filter(frameHasContent);
+    }
+
+    // Route through sleap-io.js's Labels.merge (issue #226). Match tracks by
+    // NAME — io's default is object IDENTITY, which would duplicate every track
+    // because the predictions are loaded from a separate file and never share
+    // Track objects with the project. Match videos by BASENAME — the predictions
+    // reference the same video under a possibly-different (compute-node) path.
+    // Unlike the retired hand-rolled merge, io carries centroids/bboxes/masks/
+    // rois + fromPredicted provenance, so the active-learning locator's
+    // centroid-only output now survives the merge.
+    const result = await labels.merge(predictions, {
+      track: "name",
+      video: "basename",
+      frame,
+    });
+    ctx.pushUndoSnapshot(snapshot);
+    ctx.state.markChanged();
+    // Merge mutates `labels` in place, so overlayVersion-gated consumers (the
+    // seekbar's predicted-frame marks, the canvas overlay) won't recompute
+    // until an unrelated interaction bumps it. Bump now so the light-blue
+    // predicted-frame ticks paint immediately (mirrors ToggleNegativeFrame).
+    ctx.state.bumpOverlayVersion();
+
+    const conflicts = result.conflicts.length;
+    // A box detector predicts boxes, not instances: count those so its run
+    // doesn't report "0 prediction(s)".
+    const boxes = predictions.labeledFrames.reduce(
+      (n, lf) => n + lf.bboxes.filter((b) => b.isPredicted).length,
+      0,
+    );
+    toast.success(
+      `Merged ${result.instancesAdded} prediction(s)` +
+        (boxes > 0 ? ` and ${boxes} box(es)` : "") +
+        ` across ${result.framesMerged} frame(s)` +
+        (conflicts > 0 ? `, ${conflicts} conflict(s)` : "") +
+        "."
+    );
+  },
+};
+
+/**
+ * Merge track-only results (a re-track run with no pose model — see
+ * `InferenceConfig.trackOnly`) into the current labels.
+ *
+ * Deliberately does NOT reuse {@link MergePredictions}: a track-only run never
+ * adds, removes, or moves an instance — every instance in the input .slp is
+ * still exactly there, just with `.track` (re)assigned. Routes through
+ * sleap-io.js's `"update_tracks"` frame strategy, which spatially matches
+ * instances between the current project and the retracked output (the output
+ * was round-tripped through a temp file, so its instances are structurally
+ * equal but not object-identical to the project's) and copies over ONLY
+ * `.track` + `.trackingScore`, leaving geometry/scores/everything else
+ * untouched. No `ExistingPredictionsMode` concept applies here — there is
+ * nothing to clear/replace/keep, since no instances are added or removed.
+ */
+export const MergeTracks: Command = {
+  name: "MergeTracks",
+  topics: [UpdateTopic.Labels, UpdateTopic.Frame, UpdateTopic.Instance],
+  skipAutoSnapshot: true,
+  async execute(ctx, params) {
+    const { labels } = ctx.state;
+    if (!labels) return;
+
+    const retracked = params?.retracked as Labels;
+    if (!retracked) return;
+
+    const snapshot = ctx.takeAllFramesSnapshot("MergeTracks");
+
+    // Match tracks by NAME (retracked.tracks are freshly deserialized from a
+    // temp file, so they never share object identity with the project's own
+    // Track objects) and videos by BASENAME (same reasoning as
+    // MergePredictions) — see sleap-io.js's Labels.merge().
+    const result = await labels.merge(retracked, {
+      track: "name",
+      video: "basename",
+      frame: "update_tracks",
+    });
+    ctx.pushUndoSnapshot(snapshot);
+    ctx.state.markChanged();
+    // Merge mutates `labels` in place — bump so overlay-version-gated
+    // consumers (seekbar track ticks, canvas overlay) repaint immediately.
+    ctx.state.bumpOverlayVersion();
+
+    toast.success(`Updated tracks across ${result.framesMerged} frame(s).`);
+  },
+};

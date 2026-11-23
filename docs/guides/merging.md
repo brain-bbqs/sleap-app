@@ -1,0 +1,92 @@
+# Merging Projects
+
+**File ▸ Merge into Project…** combines another `.slp` into the one you have open
+— for pulling together work split across people, sessions, or machines.
+
+## The preview
+
+Click **Choose .slp files…** and pick the file to merge in. Before anything
+changes, the app matches the two projects and shows a preview: how many
+**Videos** and **Tracks** match or are new, and whether the **Skeleton** matches.
+Nothing is applied until you click **Merge**.
+
+## Merging several files
+
+You can pick several `.slp` files at once, for example prediction files from a
+few inference runs. They're merged **one at a time**, in the order you picked
+them, and the dialog shows **File 2 of 3** and so on. Each file gets its own
+preview and conflict review:
+
+- **Merge** applies that file and moves on to the next.
+- **Skip this file** (or closing the dialog) leaves it out and moves on.
+- After the last file, the dialog closes.
+
+Each merged file is its own undo step. A file that can't be read, or whose
+skeleton differs, can only be skipped; the others still merge.
+
+Videos are matched by **basename** and tracks by **name**, so two projects
+labeling the same videos line up even if the files sit at different paths.
+
+!!! warning "The skeletons must match"
+
+    If the incoming file's skeleton differs from this project's, the preview
+    shows **Skeleton ⚠ differs** and the merge is blocked. Open that file as
+    its own project, or make the two skeletons match first.
+
+## Conflicts
+
+A **conflict** is when both projects have a user-labeled instance on the same
+frame of the same video, close enough to be the same animal (within 5 pixels).
+Predictions never count as conflicts. The app groups conflicts into clusters — a
+base instance can clash with several incoming instances and vice versa, so
+they're resolved as a unit rather than pairwise.
+
+If there are no conflicts, the dialog says it's a clean merge and **Merge**
+combines the two projects.
+
+If there are, pick a **Global rule** for them:
+
+| Rule | Resolution |
+|---|---|
+| **Keep both** *(default)* | Keep every instance from both sides |
+| **Base wins** | Keep this project's instance, discard the incoming one |
+| **Donor wins** | The incoming project's instance replaces this project's |
+
+## Reviewing conflicts
+
+For anything you don't want decided by the global rule, the conflict list
+(sortable by **Frame**, **Track**, and distance, and filterable) lets you set
+**Keep** per conflict: **Both**, **Base**, or **Donor**. Click a row to draw the
+competing instances on the actual frame so you can see which is right. **Reset
+choices** drops your per-row picks and goes back to the global rule.
+
+This is worth doing when two people labeled the same frames — the disagreements
+are exactly the frames where your labeling guidelines are ambiguous, and seeing
+them is useful beyond the merge itself.
+
+## After merging
+
+The result toast summarizes what happened. The merge is a normal command, so
+++cmd+z++ / ++ctrl+z++ undoes it.
+
+Run [Label Quality Check](label-qc.md) afterwards — merges are a common source of
+duplicate instances.
+
+## Corrections made in a separate predictions file
+
+Predictions don't always land in your training project. A predictions `.slp`
+made outside the app, or one you opened from a remote job with **Open
+predictions** instead of merging it, is a separate project. If you correct
+predictions there, those corrections are labels, but only in that file.
+
+Training only sees the project it trains on. Training on the predictions file
+alone would build a model from your corrections *without* your original
+labels, so bring them together first:
+
+1. Save the file you corrected.
+2. Open your training project.
+3. **File ▸ Merge into Project…** and choose the corrected file.
+4. Review any conflicts, click **Merge**, then save and train.
+
+Only accepted, corrected instances count as labels. Predictions you didn't
+accept come along in the merge but never train the model.
