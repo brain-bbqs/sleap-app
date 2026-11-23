@@ -20,11 +20,8 @@ import { deleteDraftEntry, type DraftManifestEntry } from "@/lib/draftManifest";
 import { videoSignature, buildBackendGraftPlan } from "@/lib/videoGraft";
 import { isDraftStaleVsDisk, isSourceChanged } from "@/lib/draftStaleness";
 import { toast } from "@/lib/notify";
+import { h5wasmUrl } from "./assetBase";
 
-const H5WASM_URL =
-  typeof location !== "undefined"
-    ? `${location.origin}/h5wasm/h5wasm.js`
-    : undefined;
 
 /** File System Access permission API (not in the standard DOM lib types). */
 interface PermissionedHandle {
@@ -205,7 +202,7 @@ export async function restoreDraft(entry: DraftManifestEntry): Promise<boolean> 
       if (!sourceHandle) return false; // cancelled the re-picker
       const draftLabels = await loadDraftBase({
         openVideos: false,
-        h5: { h5wasmUrl: H5WASM_URL },
+        h5: { h5wasmUrl: h5wasmUrl() },
       });
       // Replay any incremental delta journal appended after this base (imageless
       // frame deltas). No-op if none exists / the write path was off.
@@ -214,7 +211,7 @@ export async function restoreDraft(entry: DraftManifestEntry): Promise<boolean> 
       const originalFile = await sourceHandle.getFile();
       const originalLabels = await loadSlp(originalFile, {
         openVideos: true,
-        h5: { h5wasmUrl: H5WASM_URL },
+        h5: { h5wasmUrl: h5wasmUrl() },
         onProgress: reportParseProgress,
       });
       const draftSigs =
@@ -261,7 +258,7 @@ export async function restoreDraft(entry: DraftManifestEntry): Promise<boolean> 
       // place — permission is (re-)requested on that first write, not here.
       const draftLabels = await loadDraftBase({
         openVideos: true,
-        h5: { h5wasmUrl: H5WASM_URL },
+        h5: { h5wasmUrl: h5wasmUrl() },
         onProgress: reportParseProgress,
       });
       // Replay any incremental delta journal appended after this base (imageless

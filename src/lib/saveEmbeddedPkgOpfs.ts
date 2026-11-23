@@ -36,13 +36,10 @@ import {
   appendEncodedVideos,
 } from "@talmolab/sleap-io.js";
 import type { EmbedOption, Labels, SlpWriteOptions } from "@talmolab/sleap-io.js";
+import { h5wasmUrl } from "./assetBase";
 
 // Same derivation as loadProject.ts / saveEmbeddedPkgStreaming.ts: h5wasm served
 // same-origin (works with or without cross-origin isolation).
-const H5WASM_URL =
-  typeof location !== "undefined"
-    ? `${location.origin}/h5wasm/h5wasm.js`
-    : undefined;
 
 /**
  * True if the runtime can back the OPFS streaming save AND deliver it to disk:
@@ -122,7 +119,7 @@ export async function saveEmbeddedPkgOpfs(
       sourceFile,
       structureBytes,
       sourceFile.name,
-      H5WASM_URL
+      h5wasmUrl()
     );
     if (plan.entries.length > 0) {
       const res = await writer.appendEmbeddedVideos(plan.entries, onProgress);
@@ -178,7 +175,7 @@ export async function exportNewPkgOpfs(
     if (plan.encodeEntries.length > 0) {
       const writer = new StreamingH5Writer();
       try {
-        await writer.openWriteOpfs(opfsPath, structureBytes.byteLength, H5WASM_URL);
+        await writer.openWriteOpfs(opfsPath, structureBytes.byteLength, h5wasmUrl());
         await appendEncodedVideos(writer, labels, plan.encodeEntries, {
           onProgress: options.onProgress,
         });

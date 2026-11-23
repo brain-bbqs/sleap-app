@@ -24,6 +24,7 @@ import {
 import { sleapCmd } from "./lib/sleapPlugin";
 import { checkUpdateCached } from "./lib/updateCheckCache";
 import { readTutorialParam, TUTORIAL_PARAM } from "./lib/tutorial/startTutorial";
+import { publicAssetUrl } from "./lib/assetBase";
 
 // Drain (take, once) the pending "initial file" slot in Rust. The slot is
 // populated from a CLI argument on launch OR a macOS file-association open
@@ -74,7 +75,7 @@ export default function App() {
   useEffect(() => {
     (async () => {
       configureLibavDecoder({
-        wasmBaseUrl: `${import.meta.env.BASE_URL}decoders/libav-h264`,
+        wasmBaseUrl: publicAssetUrl("decoders/libav-h264"),
       });
       // Dev/test: force the software path even where native H.264 works, to
       // exercise the fallback end-to-end. Enable with VITE_FORCE_LIBAV_H264=1 or
@@ -110,7 +111,7 @@ export default function App() {
   useEffect(() => {
     try {
       const wasmFilePath = new URL(
-        `${import.meta.env.BASE_URL}decoders/web-demuxer/web-demuxer.wasm`,
+        publicAssetUrl("decoders/web-demuxer/web-demuxer.wasm"),
         window.location.origin
       ).href;
       configureWebDemuxer({ wasmFilePath });
