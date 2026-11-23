@@ -97,6 +97,7 @@ import {
 } from "./menuActions";
 import type { AppMenu, MenuNode, MenuRadioNode, TopMenu } from "./types";
 import { useModelOverlayStore } from "@/stores/modelOverlayStore";
+import { chooseProjectViaHost } from "@/embed/state";
 
 /** Everything that changes what the menus show. */
 export interface MenuSnapshot {
@@ -188,7 +189,7 @@ function radio(
 function fileMenu(s: MenuSnapshot): TopMenu {
   const loaded = s.projectLoaded;
   const items: MenuNode[] = [
-    { kind: "item", id: "file.new", label: "New Project...", shortcut: "$mod+KeyN", run: () => void openNewInstance() },
+    { kind: "item", id: "file.new", label: "New Project...", shortcut: "$mod+KeyN", run: () => { if (!chooseProjectViaHost("new")) void openNewInstance(); } },
     { kind: "item", id: "file.open", label: "Open Project...", shortcut: "$mod+KeyO", run: exec(OpenProjectCommand) },
     {
       kind: "submenu",

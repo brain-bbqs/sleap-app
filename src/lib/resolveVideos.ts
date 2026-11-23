@@ -614,7 +614,13 @@ export interface AutoResolveOptions {
  */
 export async function resolveExternalVideos(
   labels: Labels,
-  options?: AutoResolveOptions
+  options?: AutoResolveOptions,
+  /**
+   * An embedding host's lookup (see src/embed/), tried for each video still
+   * missing once the built-in resolution is done: true when it found the video
+   * and gave it a backend.
+   */
+  hostResolve?: (video: Video) => Promise<boolean>
 ): Promise<void> {
   // Drop the HDF5 containers held for the PREVIOUS project's videos. Every
   // project open reaches here before any container is opened for the new one,
@@ -722,6 +728,17 @@ export async function resolveExternalVideos(
         } catch (err) {
           console.warn(`[video] Failed to resolve "${candidatePath}":`, err);
         }
+      }
+    }
+  }
+
+  if (hostResolve) {
+    for (const video of labels.videos.filter(isVideoMissing)) {
+      if (isImageSequenceVideo(video)) continue;
+      try {
+        if (await hostResolve(video)) resolvedCount++;
+      } catch (err) {
+        console.warn("[video] The embedding host could not resolve a video:", err);
       }
     }
   }
@@ -1919,6 +1936,12 @@ function persistHdf5Dataset(video: Video): void {
 export interface AssignBackendOptions {
   silent?: boolean;
   /**
+   * The sleap-io.js backend to open a URL with, when the URL says nothing about
+   * its format (an extensionless presigned or blob link whose type an embedding
+   * host declared). Unset: chosen from the URL's extension, as before.
+   */
+  backend?: "mp4box" | "mediabunny" | "media" | "avi";
+  /**
    * Force (`true`/`false`) grayscale on the newly-built backend, or leave it
    * unset (`undefined`) to inherit whatever `video.backendMetadata.grayscale`
    * already records (the round-trip case: reopening/relinking a video that
@@ -2173,7 +2196,7 @@ export async function assignVideoBackendFromUrl(
       : (video.backendMetadata.grayscale as boolean | null | undefined);
   const ok = await probeAndAssignBackend(
     video,
-    () => createVideoBackend(url, { grayscale }),
+    () => createVideoBackend(url, { grayscale, ...(opts?.backend ? { backend: opts.backend } : {}) }),
     getBasename(url),
     { ...opts, grayscale }
   );

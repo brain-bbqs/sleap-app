@@ -75,6 +75,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { publicAssetUrl } from "@/lib/assetBase";
 
 // Install skeleton undo interceptor once on module load
 let interceptorInstalled = false;
@@ -104,7 +105,7 @@ function TemplatePreview({
   const { dataset } = template;
   const image = template.previewImage && (
     <img
-      src={`${import.meta.env.BASE_URL}skeleton-templates/${template.previewImage}`}
+      src={publicAssetUrl(`skeleton-templates/${template.previewImage}`)}
       alt={`Example of the ${template.name} skeleton`}
       className="h-24 w-24 shrink-0 rounded object-cover"
       draggable={false}
@@ -159,7 +160,7 @@ function TemplatePreview({
               <DialogDescription>{dataset.description}</DialogDescription>
             </DialogHeader>
             <img
-              src={`${import.meta.env.BASE_URL}skeleton-templates/${dataset.exampleImage}`}
+              src={publicAssetUrl(`skeleton-templates/${dataset.exampleImage}`)}
               alt={`Labeled frames from the ${template.name} reference dataset`}
               className="mx-auto aspect-square w-full max-w-[467px] rounded"
               draggable={false}

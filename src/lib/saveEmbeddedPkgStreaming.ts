@@ -61,12 +61,11 @@ import {
   removeFile,
 } from "./nativeWrite";
 import { fileSize, readRange } from "./nativeRange";
+import { h5wasmUrl } from "./assetBase";
 
 // Same derivation as loadProject.ts / writeBridgeSpike.ts: h5wasm must be served
 // same-origin so the streaming Worker can load it under cross-origin isolation
 // (COEP blocks the default cross-origin CDN importScripts).
-const H5WASM_URL =
-  typeof location !== "undefined" ? `${location.origin}/h5wasm/h5wasm.js` : undefined;
 
 export interface SaveEmbeddedPkgStreamingOptions {
   /** Same semantics as `saveSlpToBytes`'s `embed` option. Defaults to `false`
@@ -193,7 +192,7 @@ async function appendEmbeddedVideosToTemp(
         size: sourceSize,
         readRange: (o, l) => readRange(sourcePath, o, l),
       };
-      await writer.openAppend(destSink, tempPath, destSize, source, sourcePath, H5WASM_URL);
+      await writer.openAppend(destSink, tempPath, destSize, source, sourcePath, h5wasmUrl());
       const res = await writer.appendEmbeddedVideos(plan.entries);
       if (res.success !== true) {
         throw new Error(
@@ -207,7 +206,7 @@ async function appendEmbeddedVideosToTemp(
           `(perVideo=${JSON.stringify(res.perVideo)})`
       );
     } else {
-      await writer.openWrite(destSink, tempPath, destSize, H5WASM_URL);
+      await writer.openWrite(destSink, tempPath, destSize, h5wasmUrl());
     }
 
     if (plan.encodeEntries.length > 0) {
@@ -248,7 +247,7 @@ async function verifyAppendedTemp(
     readRange: (o, l) => readRange(tempPath, o, l),
   };
   const reader = new StreamingH5File();
-  await reader.openRange(source, { h5wasmUrl: H5WASM_URL });
+  await reader.openRange(source, { h5wasmUrl: h5wasmUrl() });
   try {
     for (const entry of [...plan.entries, ...plan.encodeEntries]) {
       const group = `video${entry.videoIndex}`;

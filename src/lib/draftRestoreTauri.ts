@@ -47,15 +47,12 @@ import { isSourceChanged } from "@/lib/draftStaleness";
 import { makeTauriJournalStore } from "@/lib/tauriDraft";
 import { replayJournal, baseBakPath } from "@/lib/incrementalAutosave";
 import type { TauriDraftManifestEntry } from "@/lib/tauriDraftManifest";
+import { h5wasmUrl } from "./assetBase";
 
 // Same threshold + h5wasm URL as loadProject.ts: files over ~1 GB open via the
 // native range reader (lazy, on-disk) instead of being read whole into WASM.
 const RANGE_READER_THRESHOLD = 1_000_000_000;
 const LAZY_VIDEO_METADATA = true;
-const H5WASM_URL =
-  typeof location !== "undefined"
-    ? `${location.origin}/h5wasm/h5wasm.js`
-    : undefined;
 
 /**
  * Read a `.slp` from a disk `path`, size-adaptively: stream large files via the
@@ -82,7 +79,7 @@ async function readLabelsFromPath(
         openVideos: !lazyMeta,
         lazyVideoMetadata: lazyMeta,
         filenameHint: path,
-        h5wasmUrl: H5WASM_URL,
+        h5wasmUrl: h5wasmUrl(),
         onProgress: reportParseProgress,
       },
     );
@@ -90,7 +87,7 @@ async function readLabelsFromPath(
   const raw = await readFile(path);
   return loadSlp(raw, {
     openVideos: true,
-    h5: { filenameHint: path, h5wasmUrl: H5WASM_URL },
+    h5: { filenameHint: path, h5wasmUrl: h5wasmUrl() },
     onProgress: reportParseProgress,
   });
 }
@@ -206,7 +203,7 @@ export async function restoreTauriDraft(
         openVideos: !entry.embedded,
         h5: {
           filenameHint: entry.projectPath ?? entry.draftPath,
-          h5wasmUrl: H5WASM_URL,
+          h5wasmUrl: h5wasmUrl(),
         },
       });
     let draftLabels: Labels;

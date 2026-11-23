@@ -18,6 +18,7 @@ import { useEffect } from "react";
 import { useAppStore } from "@/stores/appStore";
 import { isTauri } from "@/lib/platform";
 import { APP_VERSION } from "@/lib/version";
+import { pageEffectOn } from "@/embed/state";
 
 // Memoized dynamic import of the Tauri window API. The setTitle effect re-runs
 // on every filename/hasChanges change; caching the import promise avoids
@@ -49,7 +50,7 @@ export function useWindowTitle(): void {
 
   useEffect(() => {
     const title = formatWindowTitle(projectPath ?? filename, hasChanges, APP_VERSION);
-    document.title = title;
+    if (pageEffectOn("title")) document.title = title;
     if (isTauri) {
       loadTauriWindowApi()
         .then(({ getCurrentWindow }) => getCurrentWindow().setTitle(title))

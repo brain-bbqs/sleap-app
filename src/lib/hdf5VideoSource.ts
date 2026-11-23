@@ -46,6 +46,7 @@ import {
 } from "@talmolab/sleap-io.js";
 import { getPlatform } from "../platform/index";
 import { fileSize, readRange } from "./nativeRange";
+import { h5wasmUrl } from "./assetBase";
 
 /**
  * Extensions whose video data lives INSIDE an HDF5 container. Mirrors Python
@@ -95,12 +96,8 @@ export function storedHdf5Dataset(video: Video): string | null {
  * Serve h5wasm same-origin so the streaming Worker can load it under
  * cross-origin isolation (COOP/COEP) — COEP blocks the cross-origin CDN
  * `importScripts` the library defaults to. Mirrors `loadProject.ts`'s
- * `H5WASM_URL`; `public/h5wasm/h5wasm.js` ships with the app.
+ * `h5wasmUrl()`; `public/h5wasm/h5wasm.js` ships with the app.
  */
-const H5WASM_URL =
-  typeof location !== "undefined"
-    ? `${location.origin}/h5wasm/h5wasm.js`
-    : undefined;
 
 /**
  * Is the SharedArrayBuffer range bridge usable? Needs cross-origin isolation
@@ -277,13 +274,13 @@ async function openContainerUncached(path: string): Promise<StreamingH5File> {
     const size = await fileSize(path);
     await h5.openRange(
       { size, readRange: (offset, length) => readRange(path, offset, length) },
-      { h5wasmUrl: H5WASM_URL, filenameHint: path }
+      { h5wasmUrl: h5wasmUrl(), filenameHint: path }
     );
     return h5;
   }
   const platform = await getPlatform();
   const bytes = await platform.readFile(path);
-  await h5.openBuffer(bytes, { h5wasmUrl: H5WASM_URL, filenameHint: path });
+  await h5.openBuffer(bytes, { h5wasmUrl: h5wasmUrl(), filenameHint: path });
   return h5;
 }
 
@@ -421,7 +418,7 @@ export async function createHdf5BackendForFile(
 ): Promise<VideoBackend> {
   requireWorkerSupport();
   const h5 = new StreamingH5File();
-  await h5.openLocal(file, { h5wasmUrl: H5WASM_URL, filenameHint: file.name });
+  await h5.openLocal(file, { h5wasmUrl: h5wasmUrl(), filenameHint: file.name });
   try {
     // The Video's canonical filename stays the bare name in the browser (no
     // absolute path is exposed), matching the other browser-side backends.

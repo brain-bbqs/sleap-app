@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+dist-embed/
 
 # Rust/Tauri build output (also in src-tauri/.gitignore)
 # No trailing slash: also ignores a stray `target` symlink/file, not just the dir

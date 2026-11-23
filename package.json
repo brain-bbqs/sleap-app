@@ -14,6 +14,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:embed": "tsc -b && vite build --config vite.embed.config.ts",
     "preview": "vite preview",
     "lint": "eslint .",
     "typecheck:tests": "tsc -p tsconfig.test.json --noEmit",

@@ -21,6 +21,7 @@ import {
   type CocoJson,
   type ReadCocoOptions,
   type Labels,
+  type Video,
   type DlcFileSystem,
 } from "@talmolab/sleap-io.js";
 import { loadSlp, readSlpStreaming } from "@/lib/slpRead";
@@ -41,6 +42,7 @@ import { installTauriFsResolver } from "./fsResolver";
 import { fileSize, readRange } from "./nativeRange";
 import { sleapCmd } from "./sleapPlugin";
 import { basenameFromUrl } from "./urlOpen";
+import { h5wasmUrl } from "./assetBase";
 
 // Files larger than this open via the B-seam native range reader (lazy, on-disk)
 // instead of reading the whole file into WASM memory. Below it, eager is simpler
@@ -62,10 +64,6 @@ const LAZY_VIDEO_METADATA = true;
 // Serve h5wasm same-origin so the streaming Worker can load it under cross-origin
 // isolation (COOP/COEP) — COEP blocks the default cross-origin CDN importScripts.
 // public/h5wasm/h5wasm.js ships with the app (dev: Vite; prod: Tauri asset protocol).
-const H5WASM_URL =
-  typeof location !== "undefined"
-    ? `${location.origin}/h5wasm/h5wasm.js`
-    : undefined;
 
 /**
  * Bridge sleap-io.js load progress into the loading overlay.
@@ -170,7 +168,7 @@ export async function loadProjectFromFile(file: File): Promise<boolean> {
   try {
     const labels = await loadSlp(file, {
       openVideos: true,
-      h5: { h5wasmUrl: H5WASM_URL },
+      h5: { h5wasmUrl: h5wasmUrl() },
       onProgress: reportParseProgress,
     });
     store.setLoading(true, "Locating videos...");
@@ -213,12 +211,21 @@ export async function loadProjectFromFile(file: File): Promise<boolean> {
  * a full buffered download). The remotely-opened project has no local path/handle,
  * so it is Save-As only.
  */
-export async function loadProjectFromUrl(url: string): Promise<boolean> {
+export interface UrlLoadOptions {
+  /** The file's name, for a URL whose path says nothing about it (an extensionless presigned link). */
+  name?: string;
+  /** The caller has already confirmed discarding unsaved work (an embedding host asked). */
+  discardConfirmed?: boolean;
+  /** An embedding host's video lookup, for videos the project cannot open by their stored paths. */
+  hostResolve?: (video: Video) => Promise<boolean>;
+}
+
+export async function loadProjectFromUrl(url: string, opts: UrlLoadOptions = {}): Promise<boolean> {
   const store = useAppStore.getState();
 
-  if (!(await confirmDiscardUnsavedWork("Opening a new project"))) return false;
+  if (!opts.discardConfirmed && !(await confirmDiscardUnsavedWork("Opening a new project"))) return false;
 
-  const name = basenameFromUrl(url);
+  const name = opts.name ?? basenameFromUrl(url);
   store.setLoading(true, `Streaming ${name}...`);
 
   try {
@@ -229,11 +236,11 @@ export async function loadProjectFromUrl(url: string): Promise<boolean> {
       // filenameHint as the in-FS (Emscripten) filename, and a value with
       // "://" and "/" builds an invalid FS path → ENOENT before any range read.
       filenameHint: name,
-      h5wasmUrl: H5WASM_URL,
+      h5wasmUrl: h5wasmUrl(),
       onProgress: reportParseProgress,
     });
     store.setLoading(true, "Locating videos...");
-    await resolveExternalVideos(labels);
+    await resolveExternalVideos(labels, undefined, opts.hostResolve);
     // No projectPath/handle → plain Save is disabled; user must Save As.
     store.setLabels(labels, name);
     await openFirstLabeledFrame(labels);
@@ -320,7 +327,7 @@ export async function loadProjectFromPath(
         openVideos: !LAZY_VIDEO_METADATA,
         lazyVideoMetadata: LAZY_VIDEO_METADATA,
         filenameHint: path,
-        h5wasmUrl: H5WASM_URL,
+        h5wasmUrl: h5wasmUrl(),
         onProgress: reportParseProgress,
       });
     } else {
@@ -328,7 +335,7 @@ export async function loadProjectFromPath(
       store.setLoading(true, `Parsing ${filename}...`);
       labels = await loadSlp(bytes, {
         openVideos: true,
-        h5: { filenameHint: path, h5wasmUrl: H5WASM_URL },
+        h5: { filenameHint: path, h5wasmUrl: h5wasmUrl() },
         onProgress: reportParseProgress,
       });
     }
@@ -394,7 +401,7 @@ export async function loadProjectFromPath(
 export async function loadLabelsFromSlpFile(file: File): Promise<Labels> {
   return await loadSlp(file, {
     openVideos: false,
-    h5: { h5wasmUrl: H5WASM_URL },
+    h5: { h5wasmUrl: h5wasmUrl() },
   });
 }
 
@@ -406,7 +413,7 @@ export async function loadLabelsFromSlpPath(
   const bytes = await readFile(path);
   return await loadSlp(bytes, {
     openVideos: false,
-    h5: { filenameHint: path, h5wasmUrl: H5WASM_URL },
+    h5: { filenameHint: path, h5wasmUrl: h5wasmUrl() },
   });
 }
 
