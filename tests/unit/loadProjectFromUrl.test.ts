@@ -41,6 +41,7 @@ vi.mock("@talmolab/sleap-io.js", () => ({
 import { loadProjectFromUrl } from "@/lib/loadProject";
 import { useAppStore } from "@/stores/appStore";
 import { toast } from "@/lib/notify";
+import { resolveExternalVideos } from "@/lib/resolveVideos";
 
 function resetStore() {
   useAppStore.setState(useAppStore.getInitialState());
@@ -106,5 +107,30 @@ describe("loadProjectFromUrl", () => {
     expect(String((call?.[1] as { description?: string })?.description)).toContain(
       "corrupt or non-SLP file"
     );
+  });
+
+  it("takes a declared name for a link whose path says nothing about the file", async () => {
+    // An extensionless presigned link, as an archive hands out: the name travels beside it.
+    const url = "https://bucket.example/blobs/9f2c41?X-Amz-Signature=sig";
+    expect(await loadProjectFromUrl(url, { name: "labels.v001.slp" })).toBe(true);
+    const [source, options] = readSlpStreamingMock.mock.calls[0] as unknown as [string, { filenameHint?: string }];
+    expect(source).toBe(url);
+    expect(options.filenameHint).toBe("labels.v001.slp");
+    expect(useAppStore.getState().filename).toBe("labels.v001.slp");
+  });
+
+  it("hands an embedding host's video lookup to video resolution", async () => {
+    const hostResolve = async () => true;
+    await loadProjectFromUrl("https://bucket.example/blobs/9f2c41", { name: "x.slp", hostResolve });
+    const calls = (resolveExternalVideos as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    expect(calls[calls.length - 1]?.slice(1)).toEqual([undefined, hostResolve]);
+  });
+
+  it("does not ask again about unsaved work when the host already asked", async () => {
+    // Asking would wait on the confirm dialog, which nothing answers here.
+    useAppStore.setState({ hasChanges: true });
+    expect(
+      await loadProjectFromUrl("https://bucket.example/blobs/9f2c41", { name: "x.slp", discardConfirmed: true }),
+    ).toBe(true);
   });
 });
