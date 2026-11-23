@@ -31,6 +31,7 @@ import { UpdatePingDot, UpdatePill, useEnvironmentUpdateStatus } from "./UpdateI
 import { cn } from "@/lib/utils";
 import { CHECK_ENVIRONMENT_STEP } from "@/lib/tutorial/steps";
 import { publicAssetUrl } from "@/lib/assetBase";
+import { chooseProjectViaHost } from "@/embed/state";
 
 export function WelcomeScreen() {
   const { openProject, openFromDrop, loading, error } = useFileIO();
@@ -204,7 +205,10 @@ export function WelcomeScreen() {
               columns so New Project matches the whole split button. */}
           <div className="grid grid-cols-2 items-center gap-3 rounded-xl border border-border bg-card/95 backdrop-blur-sm px-4 py-3 shadow-lg">
             <Button
-              onClick={() => useAppStore.getState().setNewProjectDialogOpen(true)}
+              onClick={() => {
+                // Embedded: the host page picks where the project comes from (src/embed/).
+                if (!chooseProjectViaHost("new")) useAppStore.getState().setNewProjectDialogOpen(true);
+              }}
               size="lg"
               data-tutorial="new-project-button"
             >
@@ -216,7 +220,9 @@ export function WelcomeScreen() {
                 opening it never resizes the card. */}
             <div className="flex items-center">
               <Button
-                onClick={openProject}
+                onClick={() => {
+                  if (!chooseProjectViaHost("open")) void openProject();
+                }}
                 disabled={loading}
                 variant="outline"
                 size="lg"

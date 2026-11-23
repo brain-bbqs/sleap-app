@@ -41,6 +41,7 @@ vi.mock("@talmolab/sleap-io.js", () => ({
 import { loadProjectFromUrl } from "@/lib/loadProject";
 import { useAppStore } from "@/stores/appStore";
 import { toast } from "@/lib/notify";
+import { resolveExternalVideos } from "@/lib/resolveVideos";
 
 function resetStore() {
   useAppStore.setState(useAppStore.getInitialState());
@@ -116,5 +117,20 @@ describe("loadProjectFromUrl", () => {
     expect(source).toBe(url);
     expect(options.filenameHint).toBe("labels.v001.slp");
     expect(useAppStore.getState().filename).toBe("labels.v001.slp");
+  });
+
+  it("hands an embedding host's video lookup to video resolution", async () => {
+    const hostResolve = async () => true;
+    await loadProjectFromUrl("https://bucket.example/blobs/9f2c41", { name: "x.slp", hostResolve });
+    const calls = (resolveExternalVideos as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    expect(calls[calls.length - 1]?.slice(1)).toEqual([undefined, hostResolve]);
+  });
+
+  it("does not ask again about unsaved work when the host already asked", async () => {
+    // Asking would wait on the confirm dialog, which nothing answers here.
+    useAppStore.setState({ hasChanges: true });
+    expect(
+      await loadProjectFromUrl("https://bucket.example/blobs/9f2c41", { name: "x.slp", discardConfirmed: true }),
+    ).toBe(true);
   });
 });

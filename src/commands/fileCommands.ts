@@ -56,6 +56,7 @@ import {
   videosForAnalysis,
   type AnalysisFormat,
 } from "@/lib/analysisExport";
+import { chooseProjectViaHost } from "@/embed/state";
 
 /**
  * Save text to a user-chosen location. Tauri: native save dialog + writeFile.
@@ -193,6 +194,8 @@ export const NewProjectCommand: Command = {
   name: "NewProject",
   topics: [UpdateTopic.Project, UpdateTopic.Labels],
   async execute(ctx: CommandContext) {
+    // Embedded: the host page picks where the project comes from (src/embed/).
+    if (chooseProjectViaHost("new")) return;
     // Confirm discarding unsaved work (in-memory edits OR a not-yet-exported
     // OPFS working copy) before creating a new project.
     if (!(await confirmDiscardUnsavedWork("Creating a new project"))) return;
@@ -214,6 +217,8 @@ export const OpenProjectCommand: Command = {
   topics: [],
   skipAutoSnapshot: true,
   async execute(ctx: CommandContext) {
+    // Embedded: the host page picks the project (src/embed/).
+    if (chooseProjectViaHost("open")) return;
     const platform = await getPlatform();
     console.log(`[open] Opening project via ${platform.isTauri ? "Tauri" : "browser"} dialog`);
     const result = await platform.showOpenDialog({

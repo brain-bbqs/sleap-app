@@ -614,7 +614,13 @@ export interface AutoResolveOptions {
  */
 export async function resolveExternalVideos(
   labels: Labels,
-  options?: AutoResolveOptions
+  options?: AutoResolveOptions,
+  /**
+   * An embedding host's lookup (see src/embed/), tried for each video still
+   * missing once the built-in resolution is done: true when it found the video
+   * and gave it a backend.
+   */
+  hostResolve?: (video: Video) => Promise<boolean>
 ): Promise<void> {
   // Drop the HDF5 containers held for the PREVIOUS project's videos. Every
   // project open reaches here before any container is opened for the new one,
@@ -722,6 +728,17 @@ export async function resolveExternalVideos(
         } catch (err) {
           console.warn(`[video] Failed to resolve "${candidatePath}":`, err);
         }
+      }
+    }
+  }
+
+  if (hostResolve) {
+    for (const video of labels.videos.filter(isVideoMissing)) {
+      if (isImageSequenceVideo(video)) continue;
+      try {
+        if (await hostResolve(video)) resolvedCount++;
+      } catch (err) {
+        console.warn("[video] The embedding host could not resolve a video:", err);
       }
     }
   }

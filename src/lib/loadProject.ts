@@ -21,6 +21,7 @@ import {
   type CocoJson,
   type ReadCocoOptions,
   type Labels,
+  type Video,
   type DlcFileSystem,
 } from "@talmolab/sleap-io.js";
 import { loadSlp, readSlpStreaming } from "@/lib/slpRead";
@@ -213,12 +214,16 @@ export async function loadProjectFromFile(file: File): Promise<boolean> {
 export interface UrlLoadOptions {
   /** The file's name, for a URL whose path says nothing about it (an extensionless presigned link). */
   name?: string;
+  /** The caller has already confirmed discarding unsaved work (an embedding host asked). */
+  discardConfirmed?: boolean;
+  /** An embedding host's video lookup, for videos the project cannot open by their stored paths. */
+  hostResolve?: (video: Video) => Promise<boolean>;
 }
 
 export async function loadProjectFromUrl(url: string, opts: UrlLoadOptions = {}): Promise<boolean> {
   const store = useAppStore.getState();
 
-  if (!(await confirmDiscardUnsavedWork("Opening a new project"))) return false;
+  if (!opts.discardConfirmed && !(await confirmDiscardUnsavedWork("Opening a new project"))) return false;
 
   const name = opts.name ?? basenameFromUrl(url);
   store.setLoading(true, `Streaming ${name}...`);
@@ -235,7 +240,7 @@ export async function loadProjectFromUrl(url: string, opts: UrlLoadOptions = {})
       onProgress: reportParseProgress,
     });
     store.setLoading(true, "Locating videos...");
-    await resolveExternalVideos(labels);
+    await resolveExternalVideos(labels, undefined, opts.hostResolve);
     // No projectPath/handle → plain Save is disabled; user must Save As.
     store.setLabels(labels, name);
     await openFirstLabeledFrame(labels);

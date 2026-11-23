@@ -32,6 +32,7 @@ import { recordDraftSave, deleteDraftEntry } from "@/lib/draftManifest";
 import { removeTauriDraft } from "@/lib/tauriDraft";
 import { isSameSaveTarget } from "@/lib/saveTargetGuard";
 import { shouldOverwriteOpenedFile } from "@/lib/browserSaveTarget";
+import { currentProjectRef, embedHost, setCurrentProjectRef } from "@/embed/state";
 
 /**
  * Human-readable byte size for the save progress text (e.g. "3.8 GB", "742 MB").
@@ -225,6 +226,26 @@ export async function saveProjectAsSlp(
   const saveName = filename
     ? filename.replace(/\.slp$/, "") + ".slp"
     : "labels.slp";
+
+  // Embedded in a host page that keeps projects itself (see src/embed/): Save and
+  // Save As hand it the file, and it says where the project now lives.
+  const host = embedHost();
+  if (host?.save) {
+    try {
+      const bytes = await saveSlpToBytes(labels);
+      const ref = await host.save(new Blob([bytes.slice()]), saveName, currentProjectRef());
+      setCurrentProjectRef(ref);
+      store.clearChanges();
+      toast.success(`Saved ${saveName}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error("Failed to save project", { description: msg });
+      console.error("[save] The embedding host's save failed:", err);
+    } finally {
+      store.setLoading(false);
+    }
+    return;
+  }
 
   let displayName = saveName;
 
