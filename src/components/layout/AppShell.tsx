@@ -85,6 +85,7 @@ import {
   getUnreadCount,
   markAllRead,
 } from "../../lib/notificationStore";
+import { pageEffectOn } from "@/embed/state";
 
 /** Hosts the PathResolutionDialog, listening for custom events from stores. */
 function PathResolutionHost() {
@@ -198,6 +199,8 @@ export function AppShell() {
   // (resume-on-open can restore it) but the user hasn't written the file to disk
   // yet, so a close still deserves a warning.
   useEffect(() => {
+    // Embedded: the host page owns the unload guard, and asks the app (isDirty).
+    if (!pageEffectOn("beforeUnload")) return;
     const handler = (e: BeforeUnloadEvent) => {
       if (hasUnsavedWork(useAppStore.getState())) {
         e.preventDefault();
