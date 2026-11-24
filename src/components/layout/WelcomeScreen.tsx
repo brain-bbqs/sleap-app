@@ -9,7 +9,7 @@
  * an automatic pop-up, so it can't double-fire and is trivially escapable.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useFileIO } from "../../hooks/useFileIO";
 import { useAppStore } from "../../stores/appStore";
 import { Button } from "@/components/ui/button";
@@ -32,11 +32,17 @@ import { cn } from "@/lib/utils";
 import { CHECK_ENVIRONMENT_STEP } from "@/lib/tutorial/steps";
 import { publicAssetUrl } from "@/lib/assetBase";
 import { chooseProjectViaHost } from "@/embed/state";
+import { welcomeBackgroundStyle, type WelcomeLayout } from "@/lib/welcomeBackground";
 
 export function WelcomeScreen() {
   const { openProject, openFromDrop, loading, error } = useFileIO();
   const [drafts, setDrafts] = useState<RecoverableDraft[]>([]);
   const [showEnvironments, setShowEnvironments] = useState(false);
+  const screenRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  // The screen's size and how far the panel reaches up from its bottom edge, so
+  // the background's logo can be kept in the space above it (welcomeBackgroundStyle).
+  const [layout, setLayout] = useState<WelcomeLayout>();
   const openConnect = useCallback(() => useAppStore.getState().setConnectWindowOpen(true), []);
   // The tutorial's environment check runs before any project (and so any
   // sidebar) exists — this is the only Environment panel there is to point at.
@@ -75,6 +81,32 @@ export function WelcomeScreen() {
     };
   }, []);
 
+  useLayoutEffect(() => {
+    const screenEl = screenRef.current;
+    const panelEl = panelRef.current;
+    if (!screenEl || !panelEl || typeof ResizeObserver === "undefined") return;
+    const measure = () => {
+      const next = {
+        width: screenEl.clientWidth,
+        height: screenEl.clientHeight,
+        reserve: Math.max(0, screenEl.clientHeight - panelEl.offsetTop),
+      };
+      setLayout((prev) =>
+        prev &&
+        prev.width === next.width &&
+        prev.height === next.height &&
+        prev.reserve === next.reserve
+          ? prev
+          : next,
+      );
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(screenEl);
+    observer.observe(panelEl);
+    return () => observer.disconnect();
+  }, []);
+
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
@@ -104,17 +136,21 @@ export function WelcomeScreen() {
 
   return (
     <div
+      ref={screenRef}
       // Anchor the panel to the bottom (items-end) with padding so it sits in
       // the lower viewport and never clips (>=20px from the edge), #132.
       className="flex-1 flex items-end justify-center relative pb-6"
-      style={{
-        backgroundImage: `url(${publicAssetUrl("background.jpg")})`,
-        backgroundSize: "cover",
-        backgroundPosition: "center",
-      }}
       onDrop={handleDrop}
       onDragOver={handleDragOver}
     >
+      {/* First and without a z-index, so everything after it paints on top. */}
+      <div
+        aria-hidden
+        data-testid="welcome-background"
+        className="pointer-events-none absolute inset-x-0 bottom-0"
+        style={welcomeBackgroundStyle(publicAssetUrl("background.jpg"), layout)}
+      />
+
       <Button
         onClick={() => setShowEnvironments((v) => !v)}
         variant="ghost"
@@ -145,7 +181,7 @@ export function WelcomeScreen() {
         <WelcomeEnvironmentsPanel onClose={() => setShowEnvironments(false)} />
       )}
 
-      <div className="relative z-10 flex flex-col items-center gap-2">
+      <div ref={panelRef} className="relative z-10 flex flex-col items-center gap-2">
         {error && (
           <div className="max-w-sm text-center text-sm text-destructive bg-destructive/10 px-3 py-2 rounded-md border border-destructive/20">
             {error}
