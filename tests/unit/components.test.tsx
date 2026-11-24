@@ -397,6 +397,44 @@ describe("Component rendering", () => {
       expect(useAppStore.getState().newProjectDialogOpen).toBe(true);
     });
 
+    it("centres its background on the space above the New/Open panel", async () => {
+      // happy-dom does no layout, so give the screen a size and the panel a
+      // position: the panel's top is 420px down a 1200x600 screen.
+      const proto = HTMLElement.prototype;
+      const saved = {
+        clientWidth: Object.getOwnPropertyDescriptor(proto, "clientWidth"),
+        clientHeight: Object.getOwnPropertyDescriptor(proto, "clientHeight"),
+        offsetTop: Object.getOwnPropertyDescriptor(proto, "offsetTop"),
+      };
+      Object.defineProperty(proto, "clientWidth", { configurable: true, get: () => 1200 });
+      Object.defineProperty(proto, "clientHeight", { configurable: true, get: () => 600 });
+      Object.defineProperty(proto, "offsetTop", { configurable: true, get: () => 420 });
+      vi.stubGlobal(
+        "ResizeObserver",
+        class {
+          observe() {}
+          disconnect() {}
+        },
+      );
+      try {
+        const { WelcomeScreen } = await import(
+          "@/components/layout/WelcomeScreen"
+        );
+        render(<WelcomeScreen />);
+        const background = screen.getByTestId("welcome-background");
+        expect(background).toHaveAttribute("aria-hidden", "true");
+        expect(background.style.top).toBe("-180px");
+        expect(background.style.clipPath).toBe("inset(180px 0 0 0)");
+        expect(background.style.backgroundImage).toContain("background.jpg");
+      } finally {
+        vi.unstubAllGlobals();
+        for (const [key, descriptor] of Object.entries(saved)) {
+          if (descriptor) Object.defineProperty(proto, key, descriptor);
+          else delete (proto as unknown as Record<string, unknown>)[key];
+        }
+      }
+    });
+
     it("shows a drag-and-drop hint", async () => {
       const { WelcomeScreen } = await import(
         "@/components/layout/WelcomeScreen"
